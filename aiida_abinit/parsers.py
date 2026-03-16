@@ -79,8 +79,12 @@ class AbinitParser(Parser):
             else:
                 return self.exit_codes.ERROR_OUTPUT_MISSING
 
-            # Check for dynamic GSR file and safely fallback for DFPT
-            gsr_filepath = pl.Path(dirpath) / gsr_filename
+            # AiiDA stores plain-string retrieve-list entries using only the basename
+            # (os.path.split(remote_path)[1]), so 'outdata/out_GSR.nc' arrives as
+            # 'out_GSR.nc' at the root of the retrieved folder.  Always resolve by
+            # basename so the lookup works regardless of the outdata_prefix format.
+            gsr_basename = pl.Path(gsr_filename).name
+            gsr_filepath = pl.Path(dirpath) / gsr_basename
             if gsr_filepath.exists():
                 self._parse_gsr(str(gsr_filepath), is_relaxation)
             else:
@@ -95,7 +99,8 @@ class AbinitParser(Parser):
                 self.out('output_parameters', Dict(dict=fallback_data))
 
             # Check for dynamic HIST file
-            hist_filepath = pl.Path(dirpath) / hist_filename
+            hist_basename = pl.Path(hist_filename).name
+            hist_filepath = pl.Path(dirpath) / hist_basename
             if hist_filepath.exists():
                 self._parse_trajectory(str(hist_filepath))
             else:
