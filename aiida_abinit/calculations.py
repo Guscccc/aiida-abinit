@@ -113,7 +113,7 @@ class AbinitCalculation(CalcJob):
         spec.exit_code(302, 'ERROR_OUTPUT_PARSE',
                        message='The `stdout` output file could not be parsed.')
         spec.exit_code(303, 'ERROR_RUN_NOT_COMPLETED',
-                       message='The `abipy` `EventsParser` reports that the runw as not completed.')
+                       message='The `abipy` `EventsParser` reports that the run was not completed.')
         spec.exit_code(304, 'ERROR_OUTPUT_CONTAINS_ERRORS',
                        message='The output file contains one or more error messages.')
         spec.exit_code(305, 'ERROR_OUTPUT_CONTAINS_WARNINGS',
@@ -264,24 +264,37 @@ class AbinitCalculation(CalcJob):
         """Generate the list of files to retrieve based on the type of calculation requested in the input parameters.
 
         :param parameters: input parameters
-        :returns: list of files to retreive
+        :returns: list of files to retrieve
         """
         parameters = parameters.get_dict()
         prefix = self.metadata.options.prefix
+        outdata_prefix = parameters.get('outdata_prefix', _DATA_PREFIX.get('outdata_prefix', 'aiidao'))
 
-        # Start with the files that should always be retrieved: stdout, .abo, then add manually provided files
-        retrieve_list = [f'{prefix}.{postfix}' for postfix in [self._DEFAULT_OUTPUT_EXTENSION]]
+        retrieve_list = [f'{prefix}.{self._DEFAULT_OUTPUT_EXTENSION}']
         retrieve_list += settings.pop('ADDITIONAL_RETRIEVE_LIST', [])
 
-        # NOTE: pop here, we don't need this setting anymore
         if not settings.pop('DRY_RUN', False):
-            # In all cases except for dry runs: _GSR.nc
-            retrieve_list += [f'{_DATA_PREFIX["outdata_prefix"]}{postfix}' for postfix in ['_GSR.nc']]
-            # When moving ions: _HIST.nc
-            if parameters.get('ionmov', 0) > 0:
-                retrieve_list += [f'{_DATA_PREFIX["outdata_prefix"]}{postfix}' for postfix in ['_HIST.nc']]
+            # AiiDA will safely ignore any files in this list that ABINIT didn't actually produce
+            retrieve_list += [
+                # Core DFT / DFPT
+                f'{outdata_prefix}_GSR.nc',     
+                f'{outdata_prefix}_OUT.nc',     
+                f'{outdata_prefix}_DDB',        
+                # Band Structures & DOS
+                f'{outdata_prefix}_BANDS.nc',   
+                f'{outdata_prefix}_FATBANDS.nc',
+                f'{outdata_prefix}_DOS.nc',     
+                # Optics & Many-Body (GW/BSE)
+                f'{outdata_prefix}_OPT.nc',     
+                f'{outdata_prefix}_QPS.nc',     
+                f'{outdata_prefix}_MBS.nc',     
+                f'{outdata_prefix}_BS.nc',      
+                f'{outdata_prefix}_EXC.nc',     
+            ]
+            
+            if parameters.get('ionmov', 0) > 0 or parameters.get('optcell', 0) > 0:
+                retrieve_list += [f'{outdata_prefix}_HIST.nc']
 
-        # There may be duplicates from the `ADDITIONAL_RETRIEVE_LIST` setting, so clean up using set()
         return list(set(retrieve_list))
 
     def prepare_for_submission(self, folder):
@@ -355,7 +368,7 @@ class AbinitCalculation(CalcJob):
             parent_dir = str(parent_path.parent) if str(parent_path.parent) != '.' else './'
             parent_name = parent_path.name
 
-            # 2. Identify the current input prefix (what we are renaming it to)
+            # Identify the current input prefix (what we are renaming it to)
             current_in_prefix = str(parameters.get('indata_prefix', _DATA_PREFIX.get('indata_prefix', 'aiidai')))
             current_in_path = pl.Path(current_in_prefix)
             current_in_dir = str(current_in_path.parent) if str(current_in_path.parent) != '.' else './'

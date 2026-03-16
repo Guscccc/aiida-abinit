@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from abipy import abilab
 from abipy.dynamics.hist import HistFile
+from abipy.abio.inputs import _DATA_PREFIX
 from abipy.flowtk import events
 from aiida.common.exceptions import NotExistent
 from aiida.engine import ExitCode
@@ -29,7 +30,7 @@ DEFAULT_STRESS_UNITS = 'GPa'
 
 
 class AbinitParser(Parser):
-    """Basic parser for the ouptut of an Abinit calculation."""
+    """Basic parser for the output of an Abinit calculation."""
 
     def parse(self, **kwargs):
         """Parse outputs, store results in database."""
@@ -41,8 +42,8 @@ class AbinitParser(Parser):
         # Look for optional settings input node and potential 'parser_options' dictionary within it
         parser_options = settings.get('parser_options', None)
         if parser_options is not None:
-            error_on_warning = parser_options.get(error_on_warning, False)
-            report_comments = parser_options.get(report_comments, True)
+            error_on_warning = parser_options.get('error_on_warning', False)
+            report_comments = parser_options.get('report_comments', True)
         else:
             error_on_warning = False
             report_comments = True
@@ -59,6 +60,12 @@ class AbinitParser(Parser):
 
         retrieve_list = self.node.get_attribute('retrieve_list')
         output_filename = self.node.get_attribute('output_filename')
+        
+        # Dynamically determine the output prefix
+        outdata_prefix = parameters.get('outdata_prefix', _DATA_PREFIX.get('outdata_prefix', 'aiidao'))
+        gsr_filename = f'{outdata_prefix}_GSR.nc'
+        hist_filename = f'{outdata_prefix}_HIST.nc'
+
         with TemporaryDirectory() as dirpath:
             retrieved.copy_tree(dirpath)
 
@@ -72,15 +79,25 @@ class AbinitParser(Parser):
             else:
                 return self.exit_codes.ERROR_OUTPUT_MISSING
 
-            if (pl.Path(dirpath) / 'out_GSR.nc').exists():
-                gsr_filepath = path.join(dirpath, 'out_GSR.nc')
-                self._parse_gsr(gsr_filepath, is_relaxation)
+            # Check for dynamic GSR file and safely fallback for DFPT
+            gsr_filepath = pl.Path(dirpath) / gsr_filename
+            if gsr_filepath.exists():
+                self._parse_gsr(str(gsr_filepath), is_relaxation)
             else:
-                return self.exit_codes.ERROR_MISSING_GSR_OUTPUT_FILE
+                # Log a warning instead of killing the job (required for DFPT)
+                self.logger.warning(
+                    f"{gsr_filename} not found. This is normal for DFPT; creating fallback parameters."
+                )
+                fallback_data = {
+                    'parser_warning': f'No {gsr_filename} found. Fallback parameters only.',
+                    'is_scf_run': False
+                }
+                self.out('output_parameters', Dict(dict=fallback_data))
 
-            if (pl.Path(dirpath) / 'out_HIST.nc').exists():
-                hist_filepath = path.join(dirpath, 'out_HIST.nc')
-                self._parse_trajectory(hist_filepath)
+            # Check for dynamic HIST file
+            hist_filepath = pl.Path(dirpath) / hist_filename
+            if hist_filepath.exists():
+                self._parse_trajectory(str(hist_filepath))
             else:
                 if is_relaxation:
                     return self.exit_codes.ERROR_MISSING_HIST_OUTPUT_FILE
