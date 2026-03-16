@@ -146,16 +146,26 @@ class AbinitBaseWorkChain(BaseRestartWorkChain):
     def prepare_process(self):
         """Prepare the inputs for the next calculation.
 
-        If a `restart_calc` has been set in the context, its `remote_folder` will be used as the `parent_folder` input
-        for the next calculation and the `restart_mode` is set to `restart`. Otherwise, no `parent_folder` is used and
-        `restart_mode` is set to `from_scratch`.
+        If a `restart_calc` has been set in the context, its `remote_folder` will be used as the
+        `parent_calc_folder` input for the next calculation.
+
+        For runs that actually move ions (e.g. relaxations or MD, ``ionmov > 0``), default to the
+        conservative geometry-restart mode ``restartxf = -2`` unless the user explicitly provided a
+        different restart choice such as ``-1`` or ``-3``.
+
+        Static calculations and DFPT runs do not get a forced ``restartxf`` because they do not
+        produce/use ``HIST.nc`` in the same way.
         """
+        is_relaxation = self.ctx.inputs.parameters.get('ionmov', 0) > 0
+
         if self.ctx.restart_calc:
-            self.ctx.inputs.parameters['restartxf'] = -2
-            self.ctx.inputs.parent_folder = self.ctx.restart_calc.outputs.remote_folder
+            if is_relaxation:
+                self.ctx.inputs.parameters.setdefault('restartxf', -2)
+            self.ctx.inputs.parent_calc_folder = self.ctx.restart_calc.outputs.remote_folder
         else:
-            # Explicitly set that this is not a restart; makes querying easier
-            self.ctx.inputs.parameters['restartxf'] = 0
+            if is_relaxation:
+                # Explicitly set that this is not a restart; makes querying easier
+                self.ctx.inputs.parameters.setdefault('restartxf', 0)
 
     def report_error_handled(self, calculation, action):
         """Report an action taken for a calculation that has failed.

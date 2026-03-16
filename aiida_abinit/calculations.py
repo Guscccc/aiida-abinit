@@ -285,11 +285,24 @@ class AbinitCalculation(CalcJob):
         return list(set(retrieve_list))
 
     def prepare_for_submission(self, folder):
-        """Create the input file(s) from the input nodes.
+        """Create the input file(s) and execution instructions from the input nodes.
 
-        :param folder: an `aiida.common.folders.Folder` where the plugin should temporarily place all files needed by
-            the calculation.
-        :return: `aiida.common.datastructures.CalcInfo` instance
+        This method performs the core preparation for the AiiDA engine:
+        1. Validates the input parameters and pseudopotentials.
+        2. Generates and writes the main ABINIT input file to the local folder.
+        3. Stages local pseudopotential files into the appropriate subdirectory.
+        4. Sets up the command-line parameters and the list of files to retrieve.
+
+        Additionally, if a `parent_calc_folder` is provided for a restart, it handles
+        remote file logistics. It explicitly finds remote files matching the parent's prefix 
+        (defaulting to `outdata_prefix` or `settings['PARENT_FOLDER_PREFIX']`) and 
+        dynamically renames them to match the new `indata_prefix` during the symlink/copy 
+        step to prevent ABINIT prefix collisions.
+
+        :param folder: An `aiida.common.folders.Folder` where the plugin will temporarily 
+            place all local files needed by the calculation.
+        :return: An `aiida.common.datastructures.CalcInfo` instance containing the daemon 
+            instructions for execution, retrieval, and remote file linking.
         """
         # Process the `settings`` so that capitalization isn't an issue
         settings = uppercase_dict(self.inputs.settings.get_dict()) if 'settings' in self.inputs else {}
@@ -322,22 +335,67 @@ class AbinitCalculation(CalcJob):
         with io.open(folder.get_abs_path(self.metadata.options.input_filename), mode='w', encoding='utf-8') as stream:
             stream.write(input_filecontent)
 
-        # List the files to copy or symlink in the case of a restart
-        if 'parent_folder' in self.inputs:
-            # Symlink by default if on the same computer, otherwise copy by default
-            same_computer = self.inputs.code.computer.uuid == self.inputs.parent_folder.computer.uuid
-            if settings.pop('PARENT_FOLDER_SYMLINK', same_computer):
-                remote_symlink_list.append((
-                    self.inputs.parent_folder.computer.uuid,
-                    os.path.join(self.inputs.parent_folder.get_remote_path(), '*'),
-                    './')
-                )
-            else:
-                remote_copy_list.append((
-                    self.inputs.parent_folder.computer.uuid,
-                    os.path.join(self.inputs.parent_folder.get_remote_path(), '*'),
-                    './')
-                )
+        # List the files to copy or symlink in the case of a restart.
+        # `parent_calc_folder` is the public CalcJob input name but we also accept
+        # the legacy internal `parent_folder` key for backwards compatibility.
+        #
+        # By default, use the parent's `outdata_prefix` as the restart-file prefix.
+        # This can be overridden with the plugin setting `PARENT_FOLDER_PREFIX`, e.g.
+        # `aiidao` for older lineages that wrote restart files in the workdir root.
+        parent_folder = self.inputs.get('parent_calc_folder', self.inputs.get('parent_folder', None))
+        if parent_folder is not None:
+            parameters = self.inputs.parameters.get_dict()
+            same_computer = self.inputs.code.computer.uuid == parent_folder.computer.uuid
+            use_symlink = settings.pop('PARENT_FOLDER_SYMLINK', same_computer)
+
+            # Identify the parent prefix
+            default_parent_prefix = parameters.get('outdata_prefix', _DATA_PREFIX.get('outdata_prefix', 'aiidao'))
+            parent_prefix = settings.pop('PARENT_FOLDER_PREFIX', default_parent_prefix)
+            parent_path = pl.Path(str(parent_prefix).strip())
+            parent_dir = str(parent_path.parent) if str(parent_path.parent) != '.' else './'
+            parent_name = parent_path.name
+
+            # 2. Identify the current input prefix (what we are renaming it to)
+            current_in_prefix = str(parameters.get('indata_prefix', _DATA_PREFIX.get('indata_prefix', 'aiidai')))
+            current_in_path = pl.Path(current_in_prefix)
+            current_in_dir = str(current_in_path.parent) if str(current_in_path.parent) != '.' else './'
+            current_in_name = current_in_path.name
+
+            # Ensure the destination subdirectory (e.g., 'indata/') exists
+            if current_in_dir != './':
+                folder.get_subfolder(current_in_dir, create=True)
+
+            # list the parent files (we cannot rename files on the fly when symlinking a wildcard)
+            try:
+                list_dir_target = parent_dir if parent_dir != './' else '.'
+                existing_files = parent_folder.listdir(list_dir_target)
+            except Exception:
+                existing_files = []
+
+            # Map and rename
+            for filename in existing_files:
+                if filename.startswith(parent_name):
+                    # Extract the suffix (e.g., '_WFK' from 'aiidao_WFK')
+                    suffix = filename[len(parent_name):]
+                    
+                    # Create the new filename (e.g., 'aiidai_WFK' or 'in_WFK')
+                    new_filename = f"{current_in_name}{suffix}"
+                    
+                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_dir, filename)
+                    dest_rel_path = os.path.join(current_in_dir, new_filename)
+                    
+                    if use_symlink:
+                        remote_symlink_list.append((
+                            parent_folder.computer.uuid,
+                            remote_abs_path,
+                            dest_rel_path,
+                        ))
+                    else:
+                        remote_copy_list.append((
+                            parent_folder.computer.uuid,
+                            remote_abs_path,
+                            dest_rel_path,
+                        ))
 
         # Generate the commandline parameters
         cmdline_params = self._generate_cmdline_params(settings)
