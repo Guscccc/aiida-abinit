@@ -211,24 +211,43 @@ class AbinitCalculation(CalcJob):
 
         input_parameters = parameters.get_dict()
 
-        # Use `abipy`` to write the input file
+        # Use `abipy`` to write the input file.
+        #
+        # Multi-dataset ABINIT inputs use suffixed variable names such as
+        # `prtden1`, `getwfk3`, `optdriver5`, ... These names are valid for ABINIT but
+        # are not recognized by AbiPy's internal variable database during object
+        # construction. If we pass them directly via `abi_kwargs`, AbiPy raises an
+        # `AbinitInputError` before we even have a chance to disable spell checking.
+        #
+        # To support both single-dataset and multi-dataset inputs, we therefore:
+        #   1. create an empty `AbinitInput`
+        #   2. disable spell checking
+        #   3. assign variables one-by-one
+        #   4. inject the k-mesh information afterwards
         input_parameters = {**input_parameters, **pseudo_parameters}
+        kptopt = input_parameters.pop('kptopt', 1)
+        shiftk = input_parameters.pop('shiftk', [0.0, 0.0, 0.0])
 
         # `AbinitInput` requires a valid pseudo table / list of pseudos, so we give it the `HGH_TABLE`,
         # which should always work. In the end, we do _not_ print these to the input file.
         abi_input = AbinitInput(
             structure=abi_structure,
             pseudos=HGH_TABLE,
-            abi_kwargs=input_parameters
+            abi_kwargs={}
         )
+        abi_input.set_spell_check(False)
+
+        for key, value in input_parameters.items():
+            abi_input[key] = value
+
         try:
             abi_input.set_kmesh(
                 ngkpt=kpoints.get_kpoints_mesh()[0],
-                shiftk=input_parameters.pop('shiftk', [0.0, 0.0, 0.0]),
-                kptopt=input_parameters.pop('kptopt', 1)
+                shiftk=shiftk,
+                kptopt=kptopt
             )
         except AttributeError:
-            abi_input['kptopt'] = input_parameters.pop('kptopt', 0)
+            abi_input['kptopt'] = kptopt
             abi_input['kptnrm'] = input_parameters.pop('kptnrm', 1)
             abi_input['kpt'] = kpoints.get_kpoints()
             abi_input['nkpt'] = len(abi_input['kpt'])
@@ -269,29 +288,50 @@ class AbinitCalculation(CalcJob):
         parameters = parameters.get_dict()
         prefix = self.metadata.options.prefix
         outdata_prefix = parameters.get('outdata_prefix', _DATA_PREFIX.get('outdata_prefix', 'aiidao'))
+        ndtset = int(parameters.get('ndtset', 1) or 1)
 
         retrieve_list = [f'{prefix}.{self._DEFAULT_OUTPUT_EXTENSION}']
+        retrieve_list += [f'{prefix}.abo']
         retrieve_list += settings.pop('ADDITIONAL_RETRIEVE_LIST', [])
 
         if not settings.pop('DRY_RUN', False):
-            # AiiDA will safely ignore any files in this list that ABINIT didn't actually produce
-            retrieve_list += [
-                # Core DFT / DFPT
-                f'{outdata_prefix}_GSR.nc',     
-                f'{outdata_prefix}_OUT.nc',     
-                f'{outdata_prefix}_DDB',        
-                # Band Structures & DOS
-                f'{outdata_prefix}_BANDS.nc',   
-                f'{outdata_prefix}_FATBANDS.nc',
-                f'{outdata_prefix}_DOS.nc',     
-                # Optics & Many-Body (GW/BSE)
-                f'{outdata_prefix}_OPT.nc',     
-                f'{outdata_prefix}_QPS.nc',     
-                f'{outdata_prefix}_MBS.nc',     
-                f'{outdata_prefix}_BS.nc',      
-                f'{outdata_prefix}_EXC.nc',     
-            ]
-            
+            # AiiDA will safely ignore any files in this list that ABINIT didn't actually produce.
+            #
+            # For multi-dataset jobs (e.g. NLO / rf2-style), ABINIT writes dataset-indexed files such as:
+            #   out_DS4_DDB, out_DS5_DDB, out_DS2_GSR.nc, ...
+            # The original plugin only retrieved the single-dataset names and therefore silently missed
+            # the important DDBs needed for post-processing. Handle both cases here.
+            if ndtset <= 1:
+                retrieve_list += [
+                    # Core DFT / DFPT
+                    f'{outdata_prefix}_GSR.nc',
+                    f'{outdata_prefix}_OUT.nc',
+                    f'{outdata_prefix}_DDB',
+                    # Band Structures & DOS
+                    f'{outdata_prefix}_BANDS.nc',
+                    f'{outdata_prefix}_FATBANDS.nc',
+                    f'{outdata_prefix}_DOS.nc',
+                    # Optics & Many-Body (GW/BSE)
+                    f'{outdata_prefix}_OPT.nc',
+                    f'{outdata_prefix}_QPS.nc',
+                    f'{outdata_prefix}_MBS.nc',
+                    f'{outdata_prefix}_BS.nc',
+                    f'{outdata_prefix}_EXC.nc',
+                ]
+            else:
+                retrieve_list += [f'{outdata_prefix}_OUT.nc']
+                for idt in range(1, ndtset + 1):
+                    ds = f'{outdata_prefix}_DS{idt}'
+                    retrieve_list += [
+                        f'{ds}_GSR.nc',
+                        f'{ds}_DDB',
+                        f'{ds}_OPT.nc',
+                        f'{ds}_QPS.nc',
+                        f'{ds}_MBS.nc',
+                        f'{ds}_BS.nc',
+                        f'{ds}_EXC.nc',
+                    ]
+
             if parameters.get('ionmov', 0) > 0 or parameters.get('optcell', 0) > 0:
                 retrieve_list += [f'{outdata_prefix}_HIST.nc']
 
