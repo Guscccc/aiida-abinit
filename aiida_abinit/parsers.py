@@ -67,6 +67,33 @@ def _clean_text_value(text):
 
 
 
+def _collapse_char_sequence(array):
+    if isinstance(array, np.ma.MaskedArray):
+        array = array.filled(b'')
+
+    values = []
+    for item in np.asarray(array).tolist():
+        if item is None:
+            continue
+        if isinstance(item, bytes):
+            values.append(item)
+        else:
+            values.append(str(item).encode('utf-8', errors='ignore'))
+
+    raw = b''.join(values)
+
+    if b'\x00' in raw:
+        raw = raw.split(b'\x00', 1)[0]
+    elif b'\n' in raw:
+        last_newline = raw.rfind(b'\n')
+        trailing = raw[last_newline + 1:]
+        if trailing and len(set(trailing)) == 1:
+            raw = raw[:last_newline + 1]
+
+    return _clean_text_value(raw.decode('utf-8', errors='ignore'))
+
+
+
 def _decode_char_array(value):
     array = np.asarray(value)
 
@@ -77,9 +104,7 @@ def _decode_char_array(value):
         return _clean_text_value(item)
 
     if array.ndim == 1:
-        if array.dtype.kind == 'S':
-            return _clean_text_value(array.tobytes().decode('utf-8', errors='ignore'))
-        return _clean_text_value(''.join(str(item) for item in array.tolist()))
+        return _collapse_char_sequence(value)
 
     return [_decode_char_array(item) for item in array]
 
