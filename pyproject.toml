@@ -65,9 +65,13 @@ tests = [
 
 [project.entry-points.'aiida.calculations']
 'abinit' = 'aiida_abinit.calculations:AbinitCalculation'
+'abinit.mrgddb' = 'aiida_abinit.calculations:MrgddbCalculation'
+'abinit.anaddb' = 'aiida_abinit.calculations:AnaddbCalculation'
 
 [project.entry-points.'aiida.parsers']
 'abinit' = 'aiida_abinit.parsers:AbinitParser'
+'abinit.mrgddb' = 'aiida_abinit.parsers:MrgddbParser'
+'abinit.anaddb' = 'aiida_abinit.parsers:AnaddbParser'
 
 [project.entry-points.'aiida.workflows']
 'abinit.base' = 'aiida_abinit.workflows.base:AbinitBaseWorkChain'

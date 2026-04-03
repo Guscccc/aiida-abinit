@@ -312,3 +312,48 @@ class AbinitParser(Parser):
 
         self.out('output_trajectory', output_trajectory)
         self.out('output_structure', output_structure)
+
+
+class _AbinitUtilityParser(Parser):
+    """Parser for text-based ABINIT helper executables such as mrgddb and anaddb."""
+
+    def parse(self, **kwargs):
+        try:
+            retrieved = self.retrieved
+        except NotExistent:
+            return self.exit_codes.ERROR_NO_RETRIEVED_FOLDER
+
+        output_filename = self.node.get_attribute('output_filename')
+        retrieve_list = self.node.get_attribute('retrieve_list', [])
+
+        with TemporaryDirectory() as dirpath:
+            retrieved.copy_tree(dirpath)
+            stdout_filepath = pl.Path(dirpath) / pl.Path(output_filename).name
+            if not stdout_filepath.exists():
+                return self.exit_codes.ERROR_OUTPUT_MISSING
+
+            try:
+                stdout_text = stdout_filepath.read_text(encoding='utf-8')
+            except OSError:
+                self.logger.exception('unable to read stdout for CalcJobNode<%s>', self.node.pk)
+                return self.exit_codes.ERROR_OUTPUT_READ
+
+            retrieved_files = []
+            for relpath in retrieve_list:
+                candidate = pl.Path(dirpath) / pl.Path(relpath).name
+                if candidate.exists():
+                    retrieved_files.append(pl.Path(relpath).name)
+
+        self.out('output_parameters', Dict(dict={
+            'stdout': stdout_text,
+            'retrieved_files': sorted(set(retrieved_files)),
+        }))
+        return ExitCode(0)
+
+
+class MrgddbParser(_AbinitUtilityParser):
+    """Parser for `mrgddb` utility jobs."""
+
+
+class AnaddbParser(_AbinitUtilityParser):
+    """Parser for `anaddb` utility jobs."""

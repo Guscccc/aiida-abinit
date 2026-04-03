@@ -499,3 +499,123 @@ class AbinitCalculation(CalcJob):
         calcinfo.local_copy_list = local_copy_list
 
         return calcinfo
+
+
+class _AbinitUtilityCalculation(CalcJob):
+    """Base CalcJob for small ABINIT companion executables driven by stdin files."""
+
+    _DEFAULT_PREFIX = 'aiida'
+    _DEFAULT_INPUT_EXTENSION = 'in'
+    _DEFAULT_OUTPUT_EXTENSION = 'out'
+    _PARSER_NAME = None
+    _DEFAULT_RETRIEVE_LIST = []
+
+    @classmethod
+    def define(cls, spec):
+        super().define(spec)
+
+        spec.input('stdin_file',
+                   valid_type=orm.SinglefileData,
+                   help='Input file passed to the executable through stdin.')
+        spec.input('settings',
+                   valid_type=orm.Dict,
+                   required=False,
+                   help='Special settings such as files to stage and extra files to retrieve.')
+        spec.input_namespace('files',
+                             valid_type=orm.SinglefileData,
+                             required=False,
+                             dynamic=True,
+                             help='Additional files staged into the working directory.')
+
+        options = spec.inputs['metadata']['options']
+        if cls._PARSER_NAME is not None:
+            options['parser_name'].default = cls._PARSER_NAME
+        options['resources'].default = {'num_machines': 1, 'num_mpiprocs_per_machine': 1}
+        options['input_filename'].default = f'{cls._DEFAULT_PREFIX}.{cls._DEFAULT_INPUT_EXTENSION}'
+        options['output_filename'].default = f'{cls._DEFAULT_PREFIX}.{cls._DEFAULT_OUTPUT_EXTENSION}'
+        options['withmpi'].default = False
+
+        spec.exit_code(200, 'ERROR_NO_RETRIEVED_FOLDER', message='The retrieved folder data node could not be accessed.')
+        spec.exit_code(210, 'ERROR_OUTPUT_MISSING', message='The retrieved folder did not contain the stdout output file.')
+        spec.exit_code(301, 'ERROR_OUTPUT_READ', message='The stdout output file could not be read.')
+
+        spec.output('output_parameters',
+                    valid_type=orm.Dict,
+                    required=True,
+                    help='Plain-text stdout and retrieved-file bookkeeping.')
+        spec.default_output_node = 'output_parameters'
+
+    def _generate_cmdline_params(self, settings: dict) -> ty.List[str]:
+        cmdline_params = settings.pop('CMDLINE', [])
+        if isinstance(cmdline_params, str):
+            cmdline_params = [cmdline_params]
+        if not isinstance(cmdline_params, (list, tuple)):
+            raise exceptions.InputValidationError('`CMDLINE` setting must be a string, list or tuple.')
+        return [str(param) for param in cmdline_params]
+
+    def _generate_retrieve_list(self, settings: dict) -> list[str]:
+        retrieve_list = [self.metadata.options.output_filename]
+        retrieve_list += list(self._DEFAULT_RETRIEVE_LIST)
+        retrieve_list += settings.pop('ADDITIONAL_RETRIEVE_LIST', [])
+        return list(dict.fromkeys(retrieve_list))
+
+    def prepare_for_submission(self, folder):
+        settings = uppercase_dict(self.inputs.settings.get_dict()) if 'settings' in self.inputs else {}
+
+        local_copy_list = [
+            (
+                self.inputs.stdin_file.uuid,
+                self.inputs.stdin_file.filename,
+                self.metadata.options.input_filename,
+            )
+        ]
+
+        files_to_copy = settings.pop('FILES_TO_COPY', None)
+        if files_to_copy is None:
+            files_to_copy = [(label, label) for label in self.inputs.get('files', {}).keys()]
+
+        if not isinstance(files_to_copy, (list, tuple)):
+            raise exceptions.InputValidationError('`FILES_TO_COPY` setting must be a list of (input_label, destination) pairs.')
+
+        for item in files_to_copy:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise exceptions.InputValidationError('Invalid `FILES_TO_COPY` entry; expected (input_label, destination).')
+            link_name, dest_rel_path = item
+            try:
+                file_node = self.inputs.files[link_name]
+            except (AttributeError, KeyError) as exc:
+                raise exceptions.InputValidationError(
+                    f'`FILES_TO_COPY` references missing input file namespace key: {link_name}'
+                ) from exc
+            local_copy_list.append((file_node.uuid, file_node.filename, str(dest_rel_path)))
+
+        cmdline_params = self._generate_cmdline_params(settings)
+        retrieve_list = self._generate_retrieve_list(settings)
+
+        codeinfo = datastructures.CodeInfo()
+        codeinfo.code_uuid = self.inputs.code.uuid
+        codeinfo.cmdline_params = cmdline_params
+        codeinfo.stdin_name = self.metadata.options.input_filename
+        codeinfo.stdout_name = self.metadata.options.output_filename
+        codeinfo.withmpi = self.inputs.metadata.options.withmpi
+
+        calcinfo = datastructures.CalcInfo()
+        calcinfo.codes_info = [codeinfo]
+        calcinfo.stdin_name = self.metadata.options.input_filename
+        calcinfo.stdout_name = self.metadata.options.output_filename
+        calcinfo.retrieve_list = retrieve_list
+        calcinfo.local_copy_list = local_copy_list
+
+        return calcinfo
+
+
+class MrgddbCalculation(_AbinitUtilityCalculation):
+    """CalcJob for the ABINIT `mrgddb` utility."""
+
+    _PARSER_NAME = 'abinit.mrgddb'
+
+
+class AnaddbCalculation(_AbinitUtilityCalculation):
+    """CalcJob for the ABINIT `anaddb` utility."""
+
+    _PARSER_NAME = 'abinit.anaddb'

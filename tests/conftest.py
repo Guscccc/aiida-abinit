@@ -12,6 +12,12 @@ import pytest
 
 pytest_plugins = ['aiida.manage.tests.pytest_fixtures']  # pylint: disable=invalid-name
 
+# AiiDA's PostgreSQL test helper hardcodes `en_US.UTF-8`, which is unavailable on
+# this system. Replace it with the universally available `C.UTF-8` for the test session.
+import aiida.manage.external.postgres as aiida_postgres  # pylint: disable=wrong-import-position
+
+aiida_postgres._CREATE_DB_COMMAND = aiida_postgres._CREATE_DB_COMMAND.replace('en_US.UTF-8', 'C.UTF-8')
+
 
 @pytest.fixture(scope='session')
 def filepath_tests():
