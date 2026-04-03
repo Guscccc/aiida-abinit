@@ -3,6 +3,7 @@
 import logging
 from os import path
 import pathlib as pl
+import re
 from tempfile import TemporaryDirectory
 
 from abipy import abilab
@@ -27,6 +28,135 @@ DEFAULT_LENGTH_UNITS = 'Angstrom'
 DEFAULT_MAGNETIZATION_UNITS = 'Bohr mag. / cell'
 DEFAULT_POLARIZATION_UNITS = 'C / m^2'
 DEFAULT_STRESS_UNITS = 'GPa'
+
+
+
+def _read_singlefile_text(singlefile):
+    with singlefile.open(mode='r') as handle:
+        return handle.read()
+
+
+
+def _split_nonempty_lines(text):
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+
+def _resolve_retrieved_path(dirpath, relpath):
+    relpath = str(relpath)
+    candidate = pl.Path(dirpath) / relpath
+    if candidate.exists():
+        return candidate
+
+    candidate = pl.Path(dirpath) / pl.Path(relpath).name
+    if candidate.exists():
+        return candidate
+
+    return None
+
+
+
+def _parse_created_output_files(stdout_text):
+    created_files = re.findall(r'Creating HDf5 file(?: WITHOUT MPI-IO support)?:\s*(\S+)', stdout_text)
+    return sorted(set(created_files))
+
+
+
+def _clean_text_value(text):
+    return str(text).replace('\x00', '').strip()
+
+
+
+def _decode_char_array(value):
+    array = np.asarray(value)
+
+    if array.ndim == 0:
+        item = array.item()
+        if isinstance(item, bytes):
+            return _clean_text_value(item.decode('utf-8', errors='ignore'))
+        return _clean_text_value(item)
+
+    if array.ndim == 1:
+        if array.dtype.kind == 'S':
+            return _clean_text_value(array.tobytes().decode('utf-8', errors='ignore'))
+        return _clean_text_value(''.join(str(item) for item in array.tolist()))
+
+    return [_decode_char_array(item) for item in array]
+
+
+
+def _jsonable_value(value):
+    if isinstance(value, np.ma.MaskedArray):
+        return _jsonable_value(value.filled(np.nan))
+
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind in {'S', 'U'}:
+            return _decode_char_array(value)
+        return _jsonable_value(value.tolist())
+
+    if isinstance(value, np.generic):
+        return _jsonable_value(value.item())
+
+    if isinstance(value, bytes):
+        return _clean_text_value(value.decode('utf-8', errors='ignore'))
+
+    if isinstance(value, str):
+        return _clean_text_value(value)
+
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+
+    if isinstance(value, (int, bool)) or value is None:
+        return value
+
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_value(item) for item in value]
+
+    if isinstance(value, dict):
+        return {str(key): _jsonable_value(val) for key, val in value.items()}
+
+    return str(value)
+
+
+
+def _serialize_nc_variable(variable):
+    try:
+        raw_value = variable[()]
+    except Exception:  # pylint: disable=broad-except
+        raw_value = variable[:]
+
+    return {
+        'dtype': str(variable.dtype),
+        'dimensions': list(variable.dimensions),
+        'shape': list(variable.shape),
+        'attributes': {attr: _jsonable_value(variable.getncattr(attr)) for attr in variable.ncattrs()},
+        'value': _jsonable_value(raw_value),
+    }
+
+
+
+def _serialize_nc_group(group, *, root=False):
+    data = {
+        'dimensions': {name: len(dim) for name, dim in group.dimensions.items()},
+        'variables': {name: _serialize_nc_variable(var) for name, var in group.variables.items()},
+    }
+
+    attributes = {attr: _jsonable_value(group.getncattr(attr)) for attr in group.ncattrs()}
+    if root:
+        data['global_attributes'] = attributes
+    else:
+        data['attributes'] = attributes
+
+    if group.groups:
+        data['groups'] = {name: _serialize_nc_group(subgroup, root=False) for name, subgroup in group.groups.items()}
+
+    return data
+
+
+
+def _serialize_nc_file(filepath):
+    with nc.Dataset(filepath, 'r') as dataset:  # pylint: disable=no-member
+        return _serialize_nc_group(dataset, root=True)
 
 
 class AbinitParser(Parser):
@@ -58,8 +188,8 @@ class AbinitParser(Parser):
         optcell = parameters.get('optcell', 0)
         is_relaxation = ionmov != 0 or optcell != 0
 
-        retrieve_list = self.node.get_attribute('retrieve_list')
-        output_filename = self.node.get_attribute('output_filename')
+        retrieve_list = self.node.base.attributes.get('retrieve_list')
+        output_filename = self.node.base.attributes.get('output_filename')
         
         # Dynamically determine the output prefix
         outdata_prefix = parameters.get('outdata_prefix', _DATA_PREFIX.get('outdata_prefix', 'aiidao'))
@@ -317,19 +447,34 @@ class AbinitParser(Parser):
 class _AbinitUtilityParser(Parser):
     """Parser for text-based ABINIT helper executables such as mrgddb and anaddb."""
 
+    def _read_stdin_text(self):
+        return _read_singlefile_text(self.node.inputs.stdin_file)
+
+    def _parse_stdin_arguments(self, stdin_text):
+        return {}
+
+    def _parse_nc_outputs(self, dirpath):
+        nc_files = {}
+        for filepath in sorted(pl.Path(dirpath).rglob('*.nc')):
+            nc_files[str(filepath.relative_to(dirpath))] = _serialize_nc_file(filepath)
+        return nc_files
+
     def parse(self, **kwargs):
         try:
             retrieved = self.retrieved
         except NotExistent:
             return self.exit_codes.ERROR_NO_RETRIEVED_FOLDER
 
-        output_filename = self.node.get_attribute('output_filename')
-        retrieve_list = self.node.get_attribute('retrieve_list', [])
+        output_filename = self.node.base.attributes.get('output_filename')
+        retrieve_list = self.node.base.attributes.get('retrieve_list', [])
+        cmdline_params = list(self.node.base.attributes.get('cmdline_params', []))
+        stdin_text = self._read_stdin_text()
+        parsed_arguments = self._parse_stdin_arguments(stdin_text)
 
         with TemporaryDirectory() as dirpath:
             retrieved.copy_tree(dirpath)
-            stdout_filepath = pl.Path(dirpath) / pl.Path(output_filename).name
-            if not stdout_filepath.exists():
+            stdout_filepath = _resolve_retrieved_path(dirpath, output_filename)
+            if stdout_filepath is None:
                 return self.exit_codes.ERROR_OUTPUT_MISSING
 
             try:
@@ -339,14 +484,24 @@ class _AbinitUtilityParser(Parser):
                 return self.exit_codes.ERROR_OUTPUT_READ
 
             retrieved_files = []
+            missing_files = []
             for relpath in retrieve_list:
-                candidate = pl.Path(dirpath) / pl.Path(relpath).name
-                if candidate.exists():
-                    retrieved_files.append(pl.Path(relpath).name)
+                candidate = _resolve_retrieved_path(dirpath, relpath)
+                if candidate is not None:
+                    retrieved_files.append(str(relpath))
+                else:
+                    missing_files.append(str(relpath))
+
+            nc_files = self._parse_nc_outputs(dirpath)
 
         self.out('output_parameters', Dict(dict={
             'stdout': stdout_text,
+            'cmdline_params': cmdline_params,
+            'parsed_arguments': parsed_arguments,
             'retrieved_files': sorted(set(retrieved_files)),
+            'missing_retrieved_files': sorted(set(missing_files)),
+            'created_files': _parse_created_output_files(stdout_text),
+            'nc_files': nc_files,
         }))
         return ExitCode(0)
 
@@ -354,6 +509,62 @@ class _AbinitUtilityParser(Parser):
 class MrgddbParser(_AbinitUtilityParser):
     """Parser for `mrgddb` utility jobs."""
 
+    def _parse_stdin_arguments(self, stdin_text):
+        lines = _split_nonempty_lines(stdin_text)
+        parsed = {}
+
+        if lines:
+            parsed['output_ddb'] = lines[0]
+        if len(lines) >= 2:
+            parsed['description'] = lines[1]
+        if len(lines) >= 3:
+            try:
+                parsed['input_ddb_count'] = int(lines[2])
+            except ValueError:
+                parsed['input_ddb_count_text'] = lines[2]
+        if 'input_ddb_count' in parsed:
+            parsed['input_ddbs'] = lines[3:3 + parsed['input_ddb_count']]
+        elif len(lines) > 3:
+            parsed['input_ddbs'] = lines[3:]
+
+        return parsed
+
 
 class AnaddbParser(_AbinitUtilityParser):
     """Parser for `anaddb` utility jobs."""
+
+    _ROOT_OUTPUT_SUFFIXES = [
+        '_anaddb.nc',
+        '_PHBST.nc',
+        '_PHBANDS.agr',
+        '_PHFRQ',
+        '_PHANGMOM',
+    ]
+    _EXTRA_OUTPUTS = ['PHBST_partial_DOS']
+
+    def _parse_stdin_arguments(self, stdin_text):
+        lines = _split_nonempty_lines(stdin_text)
+        keys = [
+            'input_file',
+            'output_file',
+            'ddb_filepath',
+            'thm_output',
+            'gkk_filepath',
+            'elphon_output_root',
+            'ddk_filenames_filepath',
+        ]
+        parsed = {key: value for key, value in zip(keys, lines)}
+
+        output_file = parsed.get('output_file')
+        if output_file:
+            output_root = pl.Path(output_file).stem
+            parsed['output_root'] = output_root
+            parsed['expected_output_files'] = [output_file]
+            parsed['expected_output_files'].extend(f'{output_root}{suffix}' for suffix in self._ROOT_OUTPUT_SUFFIXES)
+            parsed['expected_output_files'].extend(self._EXTRA_OUTPUTS)
+            thm_output = parsed.get('thm_output')
+            if thm_output and not thm_output.endswith('_dummy'):
+                parsed['expected_output_files'].append(thm_output)
+            parsed['expected_output_files'] = sorted(set(parsed['expected_output_files']))
+
+        return parsed

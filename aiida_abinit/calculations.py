@@ -17,6 +17,17 @@ from pymatgen.io.abinit.abiobjects import structure_to_abivars
 from aiida_abinit.utils import seconds_to_timelimit, uppercase_dict
 
 
+
+def _read_singlefile_text(singlefile: orm.SinglefileData) -> str:
+    with singlefile.open(mode='r') as handle:
+        return handle.read()
+
+
+
+def _split_nonempty_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 class AbinitCalculation(CalcJob):
     """AiiDA calculation plugin wrapping the abinit executable."""
 
@@ -553,14 +564,19 @@ class _AbinitUtilityCalculation(CalcJob):
             raise exceptions.InputValidationError('`CMDLINE` setting must be a string, list or tuple.')
         return [str(param) for param in cmdline_params]
 
-    def _generate_retrieve_list(self, settings: dict) -> list[str]:
+    def _infer_retrieve_list(self, stdin_text: str, settings: dict) -> list[str]:
+        return []
+
+    def _generate_retrieve_list(self, settings: dict, stdin_text: str) -> list[str]:
         retrieve_list = [self.metadata.options.output_filename]
+        retrieve_list += self._infer_retrieve_list(stdin_text, settings)
         retrieve_list += list(self._DEFAULT_RETRIEVE_LIST)
         retrieve_list += settings.pop('ADDITIONAL_RETRIEVE_LIST', [])
-        return list(dict.fromkeys(retrieve_list))
+        return list(dict.fromkeys(str(path) for path in retrieve_list if path))
 
     def prepare_for_submission(self, folder):
         settings = uppercase_dict(self.inputs.settings.get_dict()) if 'settings' in self.inputs else {}
+        stdin_text = _read_singlefile_text(self.inputs.stdin_file)
 
         local_copy_list = [
             (
@@ -590,7 +606,7 @@ class _AbinitUtilityCalculation(CalcJob):
             local_copy_list.append((file_node.uuid, file_node.filename, str(dest_rel_path)))
 
         cmdline_params = self._generate_cmdline_params(settings)
-        retrieve_list = self._generate_retrieve_list(settings)
+        retrieve_list = self._generate_retrieve_list(settings, stdin_text)
 
         codeinfo = datastructures.CodeInfo()
         codeinfo.code_uuid = self.inputs.code.uuid
@@ -614,8 +630,36 @@ class MrgddbCalculation(_AbinitUtilityCalculation):
 
     _PARSER_NAME = 'abinit.mrgddb'
 
+    def _infer_retrieve_list(self, stdin_text: str, settings: dict) -> list[str]:
+        lines = _split_nonempty_lines(stdin_text)
+        return [lines[0]] if lines else []
+
 
 class AnaddbCalculation(_AbinitUtilityCalculation):
     """CalcJob for the ABINIT `anaddb` utility."""
 
     _PARSER_NAME = 'abinit.anaddb'
+    _ROOT_OUTPUT_SUFFIXES = [
+        '_anaddb.nc',
+        '_PHBST.nc',
+        '_PHBANDS.agr',
+        '_PHFRQ',
+        '_PHANGMOM',
+    ]
+    _EXTRA_OUTPUTS = ['PHBST_partial_DOS']
+
+    def _infer_retrieve_list(self, stdin_text: str, settings: dict) -> list[str]:
+        lines = _split_nonempty_lines(stdin_text)
+        if len(lines) < 2:
+            return []
+
+        retrieve_list = [lines[1]]
+        output_root = pl.Path(lines[1]).stem
+        if output_root:
+            retrieve_list.extend(f'{output_root}{suffix}' for suffix in self._ROOT_OUTPUT_SUFFIXES)
+        retrieve_list.extend(self._EXTRA_OUTPUTS)
+
+        if len(lines) >= 4 and not lines[3].endswith('_dummy'):
+            retrieve_list.append(lines[3])
+
+        return retrieve_list

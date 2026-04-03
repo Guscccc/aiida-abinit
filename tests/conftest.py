@@ -118,7 +118,6 @@ def serialize_builder():
 
 
 @pytest.fixture(scope='session', autouse=True)
-@pytest.mark.usefixtures('aiida_profile_clean')
 def pseudo_dojo(generate_psp8_data):
     """Create an PseudoDojo pseudo potential family from scratch."""
     from aiida.common.constants import elements
@@ -328,7 +327,9 @@ def generate_structure():
 
         if structure_id == 'silicon':
             param = 5.43
-            cell = [[param / 2., param / 2., 0], [param / 2., 0, param / 2.], [0, param / 2., param / 2.]]
+            # Use an equivalent positive-handed primitive cell so current AbiPy accepts it
+            # without requiring plugin-side structure sanitization.
+            cell = [[param / 2., 0, param / 2.], [param / 2., param / 2., 0], [0, param / 2., param / 2.]]
             structure = StructureData(cell=cell)
             structure.append_atom(position=(0., 0., 0.), symbols='Si', name='Si')
             structure.append_atom(position=(param / 4., param / 4., param / 4.), symbols='Si', name='Si')

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tests for the calculation classes."""
 import io
+import tempfile
+from pathlib import Path
 
 from aiida import orm
 from aiida.common import datastructures
@@ -85,38 +87,119 @@ def test_abinit_cmdline_params(fixture_sandbox, generate_calc_job, generate_inpu
 
 
 @pytest.mark.parametrize(
-    'entry_point_name,stdout_name,extra_retrieve',
+    'entry_point_name,stdin_content,files_to_copy,files_namespace,expected_retrieve',
     [
-        ('abinit.mrgddb', 'aiida.out', ['tnlo_3.ddb.out']),
-        ('abinit.anaddb', 'aiida.out', ['tnlo_4.abo']),
+        (
+            'abinit.mrgddb',
+            b'tnlo_3.ddb.out\nlinear + nonlinear response calculation\n2\ntnlo_2o_DS4_DDB\ntnlo_2o_DS5_DDB\n',
+            [('ddb_ds4', 'tnlo_2o_DS4_DDB'), ('ddb_ds5', 'tnlo_2o_DS5_DDB')],
+            {'ddb_ds4': b'ds4\n', 'ddb_ds5': b'ds5\n'},
+            ['aiida.out', 'tnlo_3.ddb.out'],
+        ),
+        (
+            'abinit.anaddb',
+            b'tnlo_4.abi\ntnlo_4.abo\ntnlo_3.ddb.out\ntnlo_4_thm_dummy\ntnlo_4_gkk_dummy\ntnlo_4_ep_dummy\ntnlo_4_ddk_dummy\n',
+            [('anaddb_input', 'tnlo_4.abi'), ('ddb_merged', 'tnlo_3.ddb.out')],
+            {'anaddb_input': b'nlflag 1\n', 'ddb_merged': b'ddb\n'},
+            ['aiida.out', 'tnlo_4.abo', 'tnlo_4_anaddb.nc', 'tnlo_4_PHBST.nc', 'tnlo_4_PHBANDS.agr', 'tnlo_4_PHFRQ', 'tnlo_4_PHANGMOM', 'PHBST_partial_DOS'],
+        ),
     ]
 )
-def test_abinit_utility_retrieve(fixture_sandbox, generate_calc_job, fixture_code, entry_point_name, stdout_name, extra_retrieve):
-    """Test retrieve list and staged files for small ABINIT utility CalcJobs."""
+def test_abinit_utility_retrieve(
+    fixture_sandbox,
+    generate_calc_job,
+    fixture_code,
+    entry_point_name,
+    stdin_content,
+    files_to_copy,
+    files_namespace,
+    expected_retrieve,
+):
+    """Test automatic retrieve list inference and staged files for utility CalcJobs."""
     from aiida.orm import Dict, SinglefileData
 
-    stdin_file = SinglefileData(io.BytesIO(b'input from stdin\n'), filename='stdin.in')
-    staged_file = SinglefileData(io.BytesIO(b'staged payload\n'), filename='payload.dat')
+    stdin_file = SinglefileData(io.BytesIO(stdin_content), filename='stdin.in')
+    files = {
+        label: SinglefileData(io.BytesIO(content), filename=f'{label}.dat')
+        for label, content in files_namespace.items()
+    }
 
     inputs = {
         'code': fixture_code(entry_point_name),
         'stdin_file': stdin_file,
         'settings': Dict(dict={
-            'FILES_TO_COPY': [('ddb_input', 'tnlo_2o_DS4_DDB')],
-            'ADDITIONAL_RETRIEVE_LIST': extra_retrieve,
+            'FILES_TO_COPY': files_to_copy,
         }),
-        'files': {
-            'ddb_input': staged_file,
-        },
+        'files': files,
     }
 
     calc_info = generate_calc_job(fixture_sandbox, entry_point_name, inputs)
 
     assert isinstance(calc_info, datastructures.CalcInfo)
     assert calc_info.codes_info[0].stdin_name == 'aiida.in'
-    assert calc_info.codes_info[0].stdout_name == stdout_name
-    assert stdout_name in calc_info.retrieve_list
-    for retrieved in extra_retrieve:
+    assert calc_info.codes_info[0].stdout_name == 'aiida.out'
+    for retrieved in expected_retrieve:
         assert retrieved in calc_info.retrieve_list
     assert any(item[2] == 'aiida.in' for item in calc_info.local_copy_list)
-    assert any(item[2] == 'tnlo_2o_DS4_DDB' for item in calc_info.local_copy_list)
+    for _, destination in files_to_copy:
+        assert any(item[2] == destination for item in calc_info.local_copy_list)
+
+
+
+def test_anaddb_nc_serializer_reads_template_outputs():
+    """Test that template anaddb NetCDF outputs are fully serialized into JSON-safe dictionaries."""
+    import netCDF4 as nc
+    import numpy as np
+
+    from aiida_abinit.parsers import _serialize_nc_file
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        anaddb_path = tmpdir / 'tnlo_4_anaddb.nc'
+        phbst_path = tmpdir / 'tnlo_4_PHBST.nc'
+
+        with nc.Dataset(anaddb_path, 'w') as ds:
+            ds.setncattr('abinit_version', '10.6.3')
+            ds.createDimension('number_of_cartesian_directions', 3)
+            ds.createDimension('number_of_atoms', 2)
+            ds.createDimension('number_of_phonon_modes', 6)
+            ds.createDimension('six', 6)
+            gamma = ds.createVariable('gamma_phonon_modes', 'f8', ('number_of_phonon_modes',))
+            gamma[:] = np.arange(6, dtype=float)
+            becs = ds.createVariable('becs_cart', 'f8', ('number_of_atoms', 'number_of_cartesian_directions', 'number_of_cartesian_directions'))
+            becs[:] = np.arange(18, dtype=float).reshape(2, 3, 3)
+            raman = ds.createVariable('raman_sus', 'f8', ('number_of_cartesian_directions', 'number_of_cartesian_directions', 'number_of_phonon_modes'))
+            raman[:] = np.arange(54, dtype=float).reshape(3, 3, 6)
+            d_tensor = ds.createVariable('d_tensor_relaxed_ion', 'f8', ('number_of_cartesian_directions', 'six'))
+            d_tensor[:] = np.arange(18, dtype=float).reshape(3, 6)
+
+        with nc.Dataset(phbst_path, 'w') as ds:
+            ds.setncattr('abinit_version', '10.6.3')
+            ds.createDimension('number_of_qpoints', 1)
+            ds.createDimension('number_of_phonon_modes', 6)
+            ds.createDimension('three', 3)
+            phfreqs = ds.createVariable('phfreqs', 'f8', ('number_of_qpoints', 'number_of_phonon_modes'))
+            phfreqs[:] = np.arange(6, dtype=float).reshape(1, 6)
+            phangmom = ds.createVariable('phangmom', 'f8', ('number_of_qpoints', 'number_of_phonon_modes', 'three'))
+            phangmom[:] = np.arange(18, dtype=float).reshape(1, 6, 3)
+
+        anaddb_nc = _serialize_nc_file(anaddb_path)
+        phbst_nc = _serialize_nc_file(phbst_path)
+
+        assert 'global_attributes' in anaddb_nc
+        assert 'dimensions' in anaddb_nc
+        assert 'variables' in anaddb_nc
+        assert 'gamma_phonon_modes' in anaddb_nc['variables']
+        assert anaddb_nc['variables']['gamma_phonon_modes']['shape'] == [6]
+        assert 'value' in anaddb_nc['variables']['gamma_phonon_modes']
+        assert 'becs_cart' in anaddb_nc['variables']
+        assert 'raman_sus' in anaddb_nc['variables']
+        assert 'd_tensor_relaxed_ion' in anaddb_nc['variables']
+
+        assert 'global_attributes' in phbst_nc
+        assert 'dimensions' in phbst_nc
+        assert 'variables' in phbst_nc
+        assert 'phfreqs' in phbst_nc['variables']
+        assert phbst_nc['variables']['phfreqs']['shape'] == [1, 6]
+        assert 'value' in phbst_nc['variables']['phfreqs']
+        assert 'phangmom' in phbst_nc['variables']
