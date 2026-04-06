@@ -28,6 +28,49 @@ def _split_nonempty_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+
+def _normalize_shift_rows(shift, *, label: str) -> list[list[float]]:
+    """Normalize `shiftk`/`shiftq`-style input into a list of 3-component rows."""
+    if not isinstance(shift, (list, tuple)):
+        raise exceptions.InputValidationError(f'{label} must be a sequence of numeric values.')
+
+    if len(shift) == 0:
+        raise exceptions.InputValidationError(f'{label} cannot be empty.')
+
+    if all(not isinstance(value, (list, tuple)) for value in shift):
+        try:
+            flat = [float(value) for value in shift]
+        except (TypeError, ValueError) as exc:
+            raise exceptions.InputValidationError(f'{label} must contain only numeric values.') from exc
+
+        if len(flat) % 3 != 0:
+            raise exceptions.InputValidationError(
+                f'{label} must contain 3 values per shift vector.'
+            )
+
+        return [flat[index:index + 3] for index in range(0, len(flat), 3)]
+
+    rows = []
+    for row in shift:
+        if not isinstance(row, (list, tuple)):
+            raise exceptions.InputValidationError(
+                f'{label} must be given either as a flat list or a list of 3-component vectors.'
+            )
+        if len(row) != 3:
+            raise exceptions.InputValidationError(f'{label} rows must each contain exactly three values.')
+        try:
+            rows.append([float(value) for value in row])
+        except (TypeError, ValueError) as exc:
+            raise exceptions.InputValidationError(f'{label} must contain only numeric values.') from exc
+
+    return rows
+
+
+
+def _single_shifts_match(lhs, rhs, *, tol: float = 1.0e-12) -> bool:
+    return len(lhs) == len(rhs) == 3 and all(abs(float(a) - float(b)) <= tol for a, b in zip(lhs, rhs))
+
+
 class AbinitCalculation(CalcJob):
     """AiiDA calculation plugin wrapping the abinit executable."""
 
@@ -237,7 +280,40 @@ class AbinitCalculation(CalcJob):
         #   4. inject the k-mesh information afterwards
         input_parameters = {**input_parameters, **pseudo_parameters}
         kptopt = input_parameters.pop('kptopt', 1)
-        shiftk = input_parameters.pop('shiftk', [0.0, 0.0, 0.0])
+        explicit_shiftk = input_parameters.pop('shiftk', None)
+
+        mesh = None
+        mesh_offset = [0.0, 0.0, 0.0]
+        try:
+            mesh, mesh_offset = kpoints.get_kpoints_mesh()
+        except AttributeError:
+            pass
+
+        if mesh is not None:
+            mesh = [int(value) for value in mesh]
+            mesh_offset = [float(value) for value in mesh_offset]
+
+            if explicit_shiftk is None:
+                shiftk = list(mesh_offset)
+            else:
+                shift_rows = _normalize_shift_rows(explicit_shiftk, label='`shiftk`')
+                if len(shift_rows) == 1:
+                    if not _single_shifts_match(shift_rows[0], mesh_offset):
+                        raise exceptions.InputValidationError(
+                            'Explicit `shiftk` does not match the offset stored in `kpoints`. '
+                            'Keep them identical or omit `shiftk` and use `kpoints` as the source of truth.'
+                        )
+                elif not _single_shifts_match(mesh_offset, [0.0, 0.0, 0.0]):
+                    raise exceptions.InputValidationError(
+                        'Regular-mesh `kpoints` can store only one offset. When specifying multiple `shiftk` vectors, '
+                        'set the `kpoints` mesh offset to Gamma `(0, 0, 0)` and pass the complete shift pattern explicitly.'
+                    )
+                shiftk = shift_rows
+        else:
+            if explicit_shiftk is not None:
+                raise exceptions.InputValidationError(
+                    '`shiftk` cannot be specified when `kpoints` does not define a regular mesh.'
+                )
 
         # `AbinitInput` requires a valid pseudo table / list of pseudos, so we give it the `HGH_TABLE`,
         # which should always work. In the end, we do _not_ print these to the input file.
@@ -251,13 +327,13 @@ class AbinitCalculation(CalcJob):
         for key, value in input_parameters.items():
             abi_input[key] = value
 
-        try:
+        if mesh is not None:
             abi_input.set_kmesh(
-                ngkpt=kpoints.get_kpoints_mesh()[0],
+                ngkpt=mesh,
                 shiftk=shiftk,
                 kptopt=kptopt
             )
-        except AttributeError:
+        else:
             abi_input['kptopt'] = kptopt
             abi_input['kptnrm'] = input_parameters.pop('kptnrm', 1)
             abi_input['kpt'] = kpoints.get_kpoints()

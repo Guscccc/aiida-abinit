@@ -5,18 +5,59 @@ import collections
 import io
 import os
 import pathlib
+import re
 import shutil
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
-pytest_plugins = ['aiida.manage.tests.pytest_fixtures']  # pylint: disable=invalid-name
+pytest_plugins = ['aiida.tools.pytest_fixtures']  # pylint: disable=invalid-name
 
-# AiiDA's PostgreSQL test helper hardcodes `en_US.UTF-8`, which is unavailable on
-# this system. Replace it with the universally available `C.UTF-8` for the test session.
-import aiida.manage.external.postgres as aiida_postgres  # pylint: disable=wrong-import-position
 
-aiida_postgres._CREATE_DB_COMMAND = aiida_postgres._CREATE_DB_COMMAND.replace('en_US.UTF-8', 'C.UTF-8')
+
+def _get_local_calculation_class(entry_point_name):
+    """Resolve local calculation classes without requiring installed entry points."""
+    if entry_point_name == 'abinit':
+        from aiida_abinit.calculations import AbinitCalculation
+        return AbinitCalculation
+    if entry_point_name == 'abinit.mrgddb':
+        from aiida_abinit.calculations import MrgddbCalculation
+        return MrgddbCalculation
+    if entry_point_name == 'abinit.anaddb':
+        from aiida_abinit.calculations import AnaddbCalculation
+        return AnaddbCalculation
+
+    from aiida.plugins import CalculationFactory
+    return CalculationFactory(entry_point_name)
+
+
+
+def _get_local_parser_class(entry_point_name):
+    """Resolve local parser classes without requiring installed entry points."""
+    if entry_point_name == 'abinit':
+        from aiida_abinit.parsers import AbinitParser
+        return AbinitParser
+    if entry_point_name == 'abinit.mrgddb':
+        from aiida_abinit.parsers import MrgddbParser
+        return MrgddbParser
+    if entry_point_name == 'abinit.anaddb':
+        from aiida_abinit.parsers import AnaddbParser
+        return AnaddbParser
+
+    from aiida.plugins import ParserFactory
+    return ParserFactory(entry_point_name)
+
+
+
+def _get_local_workchain_class(entry_point_name):
+    """Resolve local workflow classes without requiring installed entry points."""
+    if entry_point_name == 'abinit.base':
+        from aiida_abinit.workflows.base import AbinitBaseWorkChain
+        return AbinitBaseWorkChain
+
+    from aiida.plugins import WorkflowFactory
+    return WorkflowFactory(entry_point_name)
 
 
 @pytest.fixture(scope='session')
@@ -42,6 +83,33 @@ def fixture_sandbox():
     from aiida.common.folders import SandboxFolder
     with SandboxFolder() as folder:
         yield folder
+
+
+@pytest.fixture
+
+def file_regression(request):
+    """Minimal local replacement for `pytest-regressions` file checks."""
+    basepath = pathlib.Path(__file__).resolve().parent / 'calculations' / 'test_abinit'
+
+    def check(content, encoding='utf-8', extension='.in'):
+        sanitized = re.sub(r'[^A-Za-z0-9]+', '_', request.node.name)
+        candidates = [
+            basepath / f'{request.node.name}{extension}',
+            basepath / f'{sanitized}{extension}',
+        ]
+
+        expected = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if expected is None:
+            raise AssertionError(
+                'Missing regression fixture file. Tried: ' + ', '.join(str(candidate) for candidate in candidates)
+            )
+        expected_content = expected.read_text(encoding=encoding)
+        if content != expected_content:
+            raise AssertionError(
+                f'Content mismatch with regression fixture: {expected}'
+            )
+
+    return SimpleNamespace(check=check)
 
 
 @pytest.fixture
@@ -73,6 +141,24 @@ def fixture_code(fixture_localhost):
             )
 
     return _fixture_code
+
+
+@pytest.fixture(autouse=True)
+def register_local_entry_points(entry_points):
+    """Register local aiida-abinit entry points for source-tree test runs."""
+    from aiida_abinit.calculations import AbinitCalculation, AnaddbCalculation, MrgddbCalculation
+    from aiida_abinit.parsers import AbinitParser, AnaddbParser, MrgddbParser
+
+    entry_points.add(AbinitCalculation, group='aiida.calculations', name='abinit')
+    entry_points.add(MrgddbCalculation, group='aiida.calculations', name='abinit.mrgddb')
+    entry_points.add(AnaddbCalculation, group='aiida.calculations', name='abinit.anaddb')
+
+    entry_points.add(AbinitParser, group='aiida.parsers', name='abinit')
+    entry_points.add(MrgddbParser, group='aiida.parsers', name='abinit.mrgddb')
+    entry_points.add(AnaddbParser, group='aiida.parsers', name='abinit.anaddb')
+
+    from aiida_abinit.workflows.base import AbinitBaseWorkChain
+    entry_points.add(AbinitBaseWorkChain, group='aiida.workflows', name='abinit.base')
 
 
 @pytest.fixture
@@ -166,12 +252,11 @@ def generate_calc_job():
         """Fixture to generate a mock `CalcInfo` for testing calculation jobs."""
         from aiida.engine.utils import instantiate_process
         from aiida.manage.manager import get_manager
-        from aiida.plugins import CalculationFactory
 
         manager = get_manager()
         runner = manager.get_runner()
 
-        process_class = CalculationFactory(entry_point_name)
+        process_class = _get_local_calculation_class(entry_point_name)
         process = instantiate_process(runner, process_class, **inputs)
 
         calc_info = process.prepare_for_submission(folder)
@@ -371,8 +456,7 @@ def generate_parser():
         :param entry_point_name: entry point name of the parser class
         :return: the `Parser` sub class
         """
-        from aiida.plugins import ParserFactory
-        return ParserFactory(entry_point_name)
+        return _get_local_parser_class(entry_point_name)
 
     return _generate_parser
 
@@ -440,9 +524,8 @@ def generate_workchain():
         """
         from aiida.engine.utils import instantiate_process
         from aiida.manage.manager import get_manager
-        from aiida.plugins import WorkflowFactory
 
-        process_class = WorkflowFactory(entry_point)
+        process_class = _get_local_workchain_class(entry_point)
         runner = get_manager().get_runner()
         process = instantiate_process(runner, process_class, **inputs)
 

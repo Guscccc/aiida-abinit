@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from aiida import orm
-from aiida.common import datastructures
+from aiida.common import datastructures, exceptions
 import pytest
 
 
@@ -84,6 +84,100 @@ def test_abinit_cmdline_params(fixture_sandbox, generate_calc_job, generate_inpu
     calc_info = generate_calc_job(fixture_sandbox, entry_point_name, inputs)
 
     assert calc_info.codes_info[0].cmdline_params == cmdline_params
+
+
+def test_abinit_matching_explicit_shiftk_is_accepted(fixture_sandbox, generate_calc_job, generate_inputs_abinit):
+    """A single explicit `shiftk` equal to the mesh offset is allowed."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    parameters = inputs['parameters'].get_dict()
+    parameters['shiftk'] = [0.0, 0.0, 0.0]
+    inputs['parameters'] = orm.Dict(dict=parameters)
+
+    generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+    with fixture_sandbox.open('aiida.in') as handle:
+        input_written = handle.read()
+
+    assert 'ngkpt 2 2 2' in input_written
+    assert 'nshiftk 1' in input_written
+    assert 'shiftk    0.0    0.0    0.0' in input_written
+
+
+
+def test_abinit_mismatched_explicit_shiftk_is_rejected(fixture_sandbox, generate_calc_job, generate_inputs_abinit):
+    """A single explicit `shiftk` differing from the mesh offset must fail."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    parameters = inputs['parameters'].get_dict()
+    parameters['shiftk'] = [0.5, 0.0, 0.0]
+    inputs['parameters'] = orm.Dict(dict=parameters)
+
+    with pytest.raises(exceptions.InputValidationError, match='does not match the offset stored in `kpoints`'):
+        generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+
+
+def test_abinit_multishift_explicit_shiftk_is_accepted_for_gamma_centered_mesh(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+):
+    """Multiple explicit shifts are allowed when the mesh offset stored in `kpoints` is Gamma."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    parameters = inputs['parameters'].get_dict()
+    parameters['shiftk'] = [
+        0.5, 0.5, 0.5,
+        0.5, 0.0, 0.0,
+        0.0, 0.5, 0.0,
+        0.0, 0.0, 0.5,
+    ]
+    inputs['parameters'] = orm.Dict(dict=parameters)
+
+    generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+    with fixture_sandbox.open('aiida.in') as handle:
+        input_written = handle.read()
+
+    assert 'ngkpt 2 2 2' in input_written
+    assert 'nshiftk 4' in input_written
+    assert '0.5    0.5    0.5' in input_written
+    assert '0.5    0.0    0.0' in input_written
+    assert '0.0    0.5    0.0' in input_written
+    assert '0.0    0.0    0.5' in input_written
+
+
+
+def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_rejected(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+):
+    """Multiple explicit shifts are rejected when `kpoints` already encodes a nonzero mesh offset."""
+    from aiida.orm import KpointsData
+
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    kpoints = KpointsData()
+    kpoints.set_kpoints_mesh([2, 2, 2], offset=[0.5, 0.5, 0.5])
+    inputs['kpoints'] = kpoints
+
+    parameters = inputs['parameters'].get_dict()
+    parameters['shiftk'] = [
+        0.5, 0.5, 0.5,
+        0.5, 0.0, 0.0,
+        0.0, 0.5, 0.0,
+        0.0, 0.0, 0.5,
+    ]
+    inputs['parameters'] = orm.Dict(dict=parameters)
+
+    with pytest.raises(exceptions.InputValidationError, match='set the `kpoints` mesh offset to Gamma'):
+        generate_calc_job(fixture_sandbox, entry_point_name, inputs)
 
 
 @pytest.mark.parametrize(
