@@ -721,6 +721,13 @@ class AnaddbCalculation(_AbinitUtilityCalculation):
         '_PHBANDS.agr',
         '_PHFRQ',
         '_PHANGMOM',
+        '_PHDOS.nc',
+        '_PHDOS',
+        '_PHDOS_by_atom',
+        '_PHDOS_msqd',
+        '_MSQD_T',
+        '_MSQV_T',
+        '_THERMO',
     ]
     _EXTRA_OUTPUTS = ['PHBST_partial_DOS']
 
