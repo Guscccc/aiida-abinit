@@ -71,6 +71,16 @@ def _collapse_char_sequence(array):
     if isinstance(array, np.ma.MaskedArray):
         array = array.filled(b'')
 
+    chartyped = np.asarray(array)
+    if chartyped.dtype.kind in {'S', 'U'}:
+        try:
+            decoded = nc.chartostring(chartyped)
+            if isinstance(decoded, np.ndarray):
+                return _jsonable_value(decoded.tolist())
+            return _clean_text_value(decoded)
+        except Exception:
+            pass
+
     values = []
     for item in np.asarray(array).tolist():
         if item is None:
@@ -103,6 +113,15 @@ def _decode_char_array(value):
             return _clean_text_value(item.decode('utf-8', errors='ignore'))
         return _clean_text_value(item)
 
+    if array.dtype.kind in {'S', 'U'}:
+        try:
+            decoded = nc.chartostring(array)
+            if isinstance(decoded, np.ndarray):
+                return _jsonable_value(decoded.tolist())
+            return _clean_text_value(decoded)
+        except Exception:
+            pass
+
     if array.ndim == 1:
         return _collapse_char_sequence(value)
 
@@ -112,6 +131,9 @@ def _decode_char_array(value):
 
 def _jsonable_value(value):
     if isinstance(value, np.ma.MaskedArray):
+        if value.dtype.kind in {'S', 'U'}:
+            fill_value = b'' if value.dtype.kind == 'S' else ''
+            return _decode_char_array(value.filled(fill_value))
         return _jsonable_value(value.filled(np.nan))
 
     if isinstance(value, np.ndarray):
@@ -591,5 +613,34 @@ class AnaddbParser(_AbinitUtilityParser):
             if thm_output and not thm_output.endswith('_dummy'):
                 parsed['expected_output_files'].append(thm_output)
             parsed['expected_output_files'] = sorted(set(parsed['expected_output_files']))
+
+        return parsed
+
+
+class OpticParser(_AbinitUtilityParser):
+    """Parser for `optic` utility jobs."""
+
+    def _parse_stdin_arguments(self, stdin_text):
+        lines = _split_nonempty_lines(stdin_text)
+        parsed = {'raw_lines': lines}
+
+        first_line = lines[0].lstrip() if lines else ''
+        if first_line.startswith('&'):
+            try:
+                input_file = pl.Path(self.node.inputs.stdin_file.filename).name
+            except Exception:
+                input_file = ''
+            parsed['input_mode'] = 'direct_namelist'
+        elif lines:
+            input_file = pl.Path(lines[0]).name
+            parsed['input_mode'] = 'control_file'
+        else:
+            input_file = ''
+
+        if input_file:
+            output_root = pl.Path(input_file).stem
+            parsed['input_file'] = input_file
+            parsed['output_root'] = output_root
+            parsed['expected_output_files'] = [f'{output_root}_OPTIC.nc']
 
         return parsed

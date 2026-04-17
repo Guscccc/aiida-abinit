@@ -388,6 +388,7 @@ class AbinitCalculation(CalcJob):
             #   out_DS4_DDB, out_DS5_DDB, out_DS2_GSR.nc, ...
             # The original plugin only retrieved the single-dataset names and therefore silently missed
             # the important DDBs needed for post-processing. Handle both cases here.
+            # Note: this list is not exhaustive.
             if ndtset <= 1:
                 retrieve_list += [
                     # Core DFT / DFPT
@@ -395,15 +396,16 @@ class AbinitCalculation(CalcJob):
                     f'{outdata_prefix}_OUT.nc',
                     f'{outdata_prefix}_DDB',
                     # Band Structures & DOS
-                    f'{outdata_prefix}_BANDS.nc',
+                    f'{outdata_prefix}_EIG',
+                    f'{outdata_prefix}_EIG.nc',
+                    f'{outdata_prefix}_EBANDS.agr',
                     f'{outdata_prefix}_FATBANDS.nc',
-                    f'{outdata_prefix}_DOS.nc',
-                    # Optics & Many-Body (GW/BSE)
-                    f'{outdata_prefix}_OPT.nc',
-                    f'{outdata_prefix}_QPS.nc',
-                    f'{outdata_prefix}_MBS.nc',
-                    f'{outdata_prefix}_BS.nc',
-                    f'{outdata_prefix}_EXC.nc',
+                    f'{outdata_prefix}_DOS',
+                    # Optics and many-body outputs
+                    f'{outdata_prefix}_OPT',
+                    f'{outdata_prefix}_OPT2',
+                    f'{outdata_prefix}_QPS',
+                    f'{outdata_prefix}_HEXC.nc',
                 ]
             else:
                 retrieve_list += [f'{outdata_prefix}_OUT.nc']
@@ -412,11 +414,15 @@ class AbinitCalculation(CalcJob):
                     retrieve_list += [
                         f'{ds}_GSR.nc',
                         f'{ds}_DDB',
-                        f'{ds}_OPT.nc',
-                        f'{ds}_QPS.nc',
-                        f'{ds}_MBS.nc',
-                        f'{ds}_BS.nc',
-                        f'{ds}_EXC.nc',
+                        f'{ds}_EIG',
+                        f'{ds}_EIG.nc',
+                        f'{ds}_EBANDS.agr',
+                        f'{ds}_FATBANDS.nc',
+                        f'{ds}_DOS',
+                        f'{ds}_OPT',
+                        f'{ds}_OPT2',
+                        f'{ds}_QPS',
+                        f'{ds}_HEXC.nc',
                     ]
 
             if parameters.get('ionmov', 0) > 0 or parameters.get('optcell', 0) > 0:
@@ -608,6 +614,10 @@ class _AbinitUtilityCalculation(CalcJob):
                    valid_type=orm.Dict,
                    required=False,
                    help='Special settings such as files to stage and extra files to retrieve.')
+        spec.input('parent_calc_folder',
+                   valid_type=orm.RemoteData,
+                   required=False,
+                   help='A remote folder used to stage restart or utility input files.')
         spec.input_namespace('files',
                              valid_type=orm.SinglefileData,
                              required=False,
@@ -661,6 +671,8 @@ class _AbinitUtilityCalculation(CalcJob):
                 self.metadata.options.input_filename,
             )
         ]
+        remote_copy_list = []
+        remote_symlink_list = []
 
         files_to_copy = settings.pop('FILES_TO_COPY', None)
         if files_to_copy is None:
@@ -681,6 +693,71 @@ class _AbinitUtilityCalculation(CalcJob):
                 ) from exc
             local_copy_list.append((file_node.uuid, file_node.filename, str(dest_rel_path)))
 
+        parent_folder = self.inputs.get('parent_calc_folder', self.inputs.get('parent_folder', None))
+        if parent_folder is not None:
+            same_computer = self.inputs.code.computer.uuid == parent_folder.computer.uuid
+            use_symlink = settings.pop('PARENT_FOLDER_SYMLINK', same_computer)
+
+            parent_out_prefix = settings.pop('PARENT_OUTDATA_PREFIX', _DATA_PREFIX.get('outdata_prefix', 'outdata/out'))
+            parent_out_path = pl.Path(str(parent_out_prefix).strip())
+            parent_out_dir = str(parent_out_path.parent) if str(parent_out_path.parent) != '.' else './'
+            parent_out_name = parent_out_path.name
+
+            parent_in_prefix = settings.pop('PARENT_INDATA_PREFIX', _DATA_PREFIX.get('indata_prefix', 'indata/in'))
+            parent_in_path = pl.Path(str(parent_in_prefix).strip())
+            parent_in_dir = str(parent_in_path.parent) if str(parent_in_path.parent) != '.' else './'
+            parent_in_name = parent_in_path.name
+
+            current_in_prefix = settings.pop('CURRENT_INDATA_PREFIX', _DATA_PREFIX.get('indata_prefix', 'indata/in'))
+            current_in_path = pl.Path(str(current_in_prefix).strip())
+            current_in_dir = str(current_in_path.parent) if str(current_in_path.parent) != '.' else './'
+            current_in_name = current_in_path.name
+
+            if current_in_dir != './':
+                folder.get_subfolder(current_in_dir, create=True)
+
+            try:
+                list_dir_target_out = parent_out_dir if parent_out_dir != './' else '.'
+                existing_out_files = parent_folder.listdir(list_dir_target_out)
+            except Exception:
+                existing_out_files = []
+
+            try:
+                list_dir_target_in = parent_in_dir if parent_in_dir != './' else '.'
+                existing_in_files = parent_folder.listdir(list_dir_target_in)
+            except Exception:
+                existing_in_files = []
+
+            files_to_link = {}
+
+            for filename in existing_in_files:
+                if filename.startswith(parent_in_name):
+                    suffix = filename[len(parent_in_name):]
+                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_in_dir, filename)
+                    files_to_link[suffix] = remote_abs_path
+
+            for filename in existing_out_files:
+                if filename.startswith(parent_out_name):
+                    suffix = filename[len(parent_out_name):]
+                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_out_dir, filename)
+                    files_to_link[suffix] = remote_abs_path
+
+            for suffix, remote_abs_path in files_to_link.items():
+                new_filename = f'{current_in_name}{suffix}'
+                dest_rel_path = os.path.join(current_in_dir, new_filename)
+                if use_symlink:
+                    remote_symlink_list.append((
+                        parent_folder.computer.uuid,
+                        remote_abs_path,
+                        dest_rel_path,
+                    ))
+                else:
+                    remote_copy_list.append((
+                        parent_folder.computer.uuid,
+                        remote_abs_path,
+                        dest_rel_path,
+                    ))
+
         cmdline_params = self._generate_cmdline_params(settings)
         retrieve_list = self._generate_retrieve_list(settings, stdin_text)
 
@@ -696,6 +773,8 @@ class _AbinitUtilityCalculation(CalcJob):
         calcinfo.stdin_name = self.metadata.options.input_filename
         calcinfo.stdout_name = self.metadata.options.output_filename
         calcinfo.retrieve_list = retrieve_list
+        calcinfo.remote_symlink_list = remote_symlink_list
+        calcinfo.remote_copy_list = remote_copy_list
         calcinfo.local_copy_list = local_copy_list
 
         return calcinfo
@@ -746,3 +825,156 @@ class AnaddbCalculation(_AbinitUtilityCalculation):
             retrieve_list.append(lines[3])
 
         return retrieve_list
+
+
+class OpticCalculation(_AbinitUtilityCalculation):
+    """CalcJob for the ABINIT `optic` utility."""
+
+    _PARSER_NAME = 'abinit.optic'
+    _DEFAULT_INPUT_EXTENSION = 'abi'
+    _DEFAULT_OUTPUT_EXTENSION = 'stdout'
+
+    def _generate_cmdline_params(self, settings: dict) -> ty.List[str]:
+        cmdline_params = super()._generate_cmdline_params(settings)
+        return [self.metadata.options.input_filename, *cmdline_params]
+
+    @staticmethod
+    def _parse_optic_component_lists(text: str) -> dict[str, ty.Any]:
+        lines = _split_nonempty_lines(text)
+        num_lin = 0
+        num_nonlin = 0
+        num_linel = 0
+        lin_components: list[str] = []
+        nonlin_components: list[str] = []
+        linel_components: list[str] = []
+
+        for line in lines:
+            parts = [token for token in line.replace(',', ' ').split() if token != '=']
+            if len(parts) < 2:
+                continue
+            key = parts[0].lower()
+            values = parts[1:]
+            if key == 'num_lin_comp':
+                try:
+                    num_lin = int(values[0])
+                except ValueError:
+                    num_lin = 0
+            elif key == 'lin_comp':
+                lin_components = values
+            elif key == 'num_nonlin_comp':
+                try:
+                    num_nonlin = int(values[0])
+                except ValueError:
+                    num_nonlin = 0
+            elif key == 'nonlin_comp':
+                nonlin_components = values
+            elif key == 'num_linel_comp':
+                try:
+                    num_linel = int(values[0])
+                except ValueError:
+                    num_linel = 0
+            elif key == 'linel_comp':
+                linel_components = values
+
+        return {
+            'num_lin': num_lin,
+            'num_nonlin': num_nonlin,
+            'num_linel': num_linel,
+            'lin_components': lin_components,
+            'nonlin_components': nonlin_components,
+            'linel_components': linel_components,
+        }
+
+    def _resolve_optic_input_text(self, stdin_text: str) -> tuple[str, str]:
+        lines = _split_nonempty_lines(stdin_text)
+        first_line = lines[0].lstrip() if lines else ''
+        if first_line.startswith('&'):
+            try:
+                input_file = pl.Path(self.inputs.stdin_file.filename).name
+            except Exception:
+                input_file = ''
+            return input_file, stdin_text
+
+        input_file = pl.Path(lines[0]).name if lines else ''
+        if not input_file:
+            return '', ''
+
+        files_to_copy = None
+        if 'settings' in self.inputs:
+            try:
+                files_to_copy = uppercase_dict(self.inputs.settings.get_dict()).get('FILES_TO_COPY', None)
+            except Exception:
+                files_to_copy = None
+
+        candidate_labels: list[str] = []
+        if isinstance(files_to_copy, (list, tuple)):
+            for item in files_to_copy:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                label, destination = item
+                if pl.Path(str(destination)).name == input_file:
+                    candidate_labels.append(str(label))
+
+        if not candidate_labels:
+            for label, node in self.inputs.get('files', {}).items():
+                try:
+                    if pl.Path(str(node.filename)).name == input_file:
+                        candidate_labels.append(str(label))
+                except Exception:
+                    continue
+
+        for label in candidate_labels:
+            try:
+                return input_file, _read_singlefile_text(self.inputs.files[label])
+            except Exception:
+                continue
+
+        return input_file, ''
+
+    def _infer_retrieve_list(self, stdin_text: str, settings: dict) -> list[str]:
+        del settings
+        input_file, optic_input_text = self._resolve_optic_input_text(stdin_text)
+        if not input_file:
+            return []
+
+        retrieve_list: list[str] = []
+        output_root = pl.Path(input_file).stem
+        optic_nc = f'{output_root}_OPTIC.nc' if output_root else None
+
+        def _extend_component_outputs(prefixes: list[str], suffixes: list[str]) -> None:
+            for prefix in prefixes:
+                clean = ''.join(ch for ch in str(prefix).strip() if ch.isdigit())
+                if not clean:
+                    continue
+                tokens = [token.zfill(4) for token in (clean[i:i + 1] for i in range(len(clean)))]
+                if len(tokens) == 2:
+                    base = f'{output_root}_{tokens[0]}_{tokens[1]}'
+                elif len(tokens) == 3:
+                    base = f'{output_root}_{tokens[0]}_{tokens[1]}_{tokens[2]}'
+                else:
+                    continue
+                retrieve_list.extend(f'{base}-{suffix}' for suffix in suffixes)
+
+        parsed = self._parse_optic_component_lists(optic_input_text)
+        _extend_component_outputs(parsed['lin_components'][:parsed['num_lin']], ['linopt.out'])
+        _extend_component_outputs(parsed['nonlin_components'][:parsed['num_nonlin']], [
+            'ChiTotRe.out',
+            'ChiTotIm.out',
+            'ChiRe.out',
+            'ChiIm.out',
+            'ChiReDec.out',
+            'ChiImDec.out',
+            'ChiAbs.out',
+        ])
+        _extend_component_outputs(parsed['linel_components'][:parsed['num_linel']], [
+            'ChiEORe.out',
+            'ChiEOIm.out',
+            'ChiEOAbs.out',
+            'ChiEOTotRe.out',
+            'ChiEOTotIm.out',
+        ])
+
+        if optic_nc:
+            retrieve_list.append(optic_nc)
+
+        return list(dict.fromkeys(retrieve_list))

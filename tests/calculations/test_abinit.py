@@ -181,7 +181,7 @@ def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_reject
 
 
 @pytest.mark.parametrize(
-    'entry_point_name,stdin_content,files_to_copy,files_namespace,expected_retrieve',
+    'entry_point_name,stdin_content,files_to_copy,files_namespace,expected_retrieve,expected_stdin_name',
     [
         (
             'abinit.mrgddb',
@@ -189,6 +189,7 @@ def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_reject
             [('ddb_ds4', 'tnlo_2o_DS4_DDB'), ('ddb_ds5', 'tnlo_2o_DS5_DDB')],
             {'ddb_ds4': b'ds4\n', 'ddb_ds5': b'ds5\n'},
             ['aiida.out', 'tnlo_3.ddb.out'],
+            'aiida.in',
         ),
         (
             'abinit.anaddb',
@@ -212,6 +213,31 @@ def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_reject
                 'tnlo_4_THERMO',
                 'PHBST_partial_DOS',
             ],
+            'aiida.in',
+        ),
+        (
+            'abinit.optic',
+            b'toptic_2.abi\n',
+            [('optic_input', 'toptic_2.abi')],
+            {'optic_input': b'&FILES\n wfkfile = \'toptic_1o_DS3_WFK\'\n/\n&PARAMETERS\n scissor = 0.1,\n/\n&COMPUTATIONS\n num_lin_comp = 1,\n lin_comp = 11,\n num_nonlin_comp = 1,\n nonlin_comp = 123,\n num_linel_comp = 1,\n linel_comp = 123,\n/\n'},
+            [
+                'aiida.stdout',
+                'toptic_2_0001_0001-linopt.out',
+                'toptic_2_0001_0002_0003-ChiTotRe.out',
+                'toptic_2_0001_0002_0003-ChiTotIm.out',
+                'toptic_2_0001_0002_0003-ChiTotAbs.out',
+                'toptic_2_0001_0002_0003-ChiRe.out',
+                'toptic_2_0001_0002_0003-ChiIm.out',
+                'toptic_2_0001_0002_0003-ChiAbs.out',
+                'toptic_2_0001_0002_0003-ChiEORe.out',
+                'toptic_2_0001_0002_0003-ChiEOIm.out',
+                'toptic_2_0001_0002_0003-ChiEOAbs.out',
+                'toptic_2_0001_0002_0003-ChiEOTotRe.out',
+                'toptic_2_0001_0002_0003-ChiEOTotIm.out',
+                'toptic_2_0001_0002_0003-ChiEOTotAbs.out',
+                'toptic_2_OPTIC.nc',
+            ],
+            'aiida.abi',
         ),
     ]
 )
@@ -224,6 +250,7 @@ def test_abinit_utility_retrieve(
     files_to_copy,
     files_namespace,
     expected_retrieve,
+    expected_stdin_name,
 ):
     """Test automatic retrieve list inference and staged files for utility CalcJobs."""
     from aiida.orm import Dict, SinglefileData
@@ -246,13 +273,16 @@ def test_abinit_utility_retrieve(
     calc_info = generate_calc_job(fixture_sandbox, entry_point_name, inputs)
 
     assert isinstance(calc_info, datastructures.CalcInfo)
-    assert calc_info.codes_info[0].stdin_name == 'aiida.in'
-    assert calc_info.codes_info[0].stdout_name == 'aiida.out'
+    assert calc_info.codes_info[0].stdin_name == expected_stdin_name
+    assert calc_info.codes_info[0].stdout_name in {'aiida.out', 'aiida.stdout'}
     for retrieved in expected_retrieve:
         assert retrieved in calc_info.retrieve_list
-    assert any(item[2] == 'aiida.in' for item in calc_info.local_copy_list)
+    if expected_stdin_name is not None:
+        assert any(item[2] == expected_stdin_name for item in calc_info.local_copy_list)
     for _, destination in files_to_copy:
         assert any(item[2] == destination for item in calc_info.local_copy_list)
+    if entry_point_name == 'abinit.optic':
+        assert calc_info.codes_info[0].cmdline_params[0] == 'aiida.abi'
 
 
 

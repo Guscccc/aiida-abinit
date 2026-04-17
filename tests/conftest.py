@@ -27,6 +27,9 @@ def _get_local_calculation_class(entry_point_name):
     if entry_point_name == 'abinit.anaddb':
         from aiida_abinit.calculations import AnaddbCalculation
         return AnaddbCalculation
+    if entry_point_name == 'abinit.optic':
+        from aiida_abinit.calculations import OpticCalculation
+        return OpticCalculation
 
     from aiida.plugins import CalculationFactory
     return CalculationFactory(entry_point_name)
@@ -44,6 +47,9 @@ def _get_local_parser_class(entry_point_name):
     if entry_point_name == 'abinit.anaddb':
         from aiida_abinit.parsers import AnaddbParser
         return AnaddbParser
+    if entry_point_name == 'abinit.optic':
+        from aiida_abinit.parsers import OpticParser
+        return OpticParser
 
     from aiida.plugins import ParserFactory
     return ParserFactory(entry_point_name)
@@ -146,16 +152,18 @@ def fixture_code(fixture_localhost):
 @pytest.fixture(autouse=True)
 def register_local_entry_points(entry_points):
     """Register local aiida-abinit entry points for source-tree test runs."""
-    from aiida_abinit.calculations import AbinitCalculation, AnaddbCalculation, MrgddbCalculation
-    from aiida_abinit.parsers import AbinitParser, AnaddbParser, MrgddbParser
+    from aiida_abinit.calculations import AbinitCalculation, AnaddbCalculation, MrgddbCalculation, OpticCalculation
+    from aiida_abinit.parsers import AbinitParser, AnaddbParser, MrgddbParser, OpticParser
 
     entry_points.add(AbinitCalculation, group='aiida.calculations', name='abinit')
     entry_points.add(MrgddbCalculation, group='aiida.calculations', name='abinit.mrgddb')
     entry_points.add(AnaddbCalculation, group='aiida.calculations', name='abinit.anaddb')
+    entry_points.add(OpticCalculation, group='aiida.calculations', name='abinit.optic')
 
     entry_points.add(AbinitParser, group='aiida.parsers', name='abinit')
     entry_points.add(MrgddbParser, group='aiida.parsers', name='abinit.mrgddb')
     entry_points.add(AnaddbParser, group='aiida.parsers', name='abinit.anaddb')
+    entry_points.add(OpticParser, group='aiida.parsers', name='abinit.optic')
 
     from aiida_abinit.workflows.base import AbinitBaseWorkChain
     entry_points.add(AbinitBaseWorkChain, group='aiida.workflows', name='abinit.base')
