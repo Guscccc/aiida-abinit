@@ -29,6 +29,152 @@ def _split_nonempty_lines(text: str) -> list[str]:
 
 
 
+def _parse_optic_component_lists(text: str) -> dict[str, ty.Any]:
+    lines = _split_nonempty_lines(text)
+    num_lin = 0
+    num_nonlin = 0
+    num_linel = 0
+    lin_components: list[str] = []
+    nonlin_components: list[str] = []
+    linel_components: list[str] = []
+
+    for line in lines:
+        parts = [token for token in line.replace(',', ' ').split() if token != '=']
+        if len(parts) < 2:
+            continue
+        key = parts[0].lower()
+        values = parts[1:]
+        if key == 'num_lin_comp':
+            try:
+                num_lin = int(values[0])
+            except ValueError:
+                num_lin = 0
+        elif key == 'lin_comp':
+            lin_components = values
+        elif key == 'num_nonlin_comp':
+            try:
+                num_nonlin = int(values[0])
+            except ValueError:
+                num_nonlin = 0
+        elif key == 'nonlin_comp':
+            nonlin_components = values
+        elif key == 'num_linel_comp':
+            try:
+                num_linel = int(values[0])
+            except ValueError:
+                num_linel = 0
+        elif key == 'linel_comp':
+            linel_components = values
+
+    return {
+        'num_lin': num_lin,
+        'num_nonlin': num_nonlin,
+        'num_linel': num_linel,
+        'lin_components': lin_components,
+        'nonlin_components': nonlin_components,
+        'linel_components': linel_components,
+    }
+
+
+
+def _resolve_optic_input_text(
+    stdin_text: str,
+    *,
+    stdin_filename: str,
+    files_namespace: ty.Mapping[str, orm.SinglefileData] | None = None,
+    files_to_copy: list[tuple[str, str]] | None = None,
+) -> tuple[str, str]:
+    lines = _split_nonempty_lines(stdin_text)
+    first_line = lines[0].lstrip() if lines else ''
+    if first_line.startswith('&'):
+        return pl.Path(stdin_filename).name if stdin_filename else '', stdin_text
+
+    input_file = pl.Path(lines[0]).name if lines else ''
+    if not input_file:
+        return '', ''
+
+    files_namespace = files_namespace or {}
+    candidate_labels: list[str] = []
+    if isinstance(files_to_copy, (list, tuple)):
+        for item in files_to_copy:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            label, destination = item
+            if pl.Path(str(destination)).name == input_file:
+                candidate_labels.append(str(label))
+
+    if not candidate_labels:
+        for label, node in files_namespace.items():
+            try:
+                if pl.Path(str(node.filename)).name == input_file:
+                    candidate_labels.append(str(label))
+            except Exception:
+                continue
+
+    for label in candidate_labels:
+        try:
+            return input_file, _read_singlefile_text(files_namespace[label])
+        except Exception:
+            continue
+
+    return input_file, ''
+
+
+
+def _infer_optic_retrieve_list_from_text(stdin_text: str, *, stdin_filename: str, files_namespace=None, files_to_copy=None) -> list[str]:
+    input_file, optic_input_text = _resolve_optic_input_text(
+        stdin_text,
+        stdin_filename=stdin_filename,
+        files_namespace=files_namespace,
+        files_to_copy=files_to_copy,
+    )
+    if not input_file:
+        return []
+
+    retrieve_list: list[str] = []
+    output_root = pl.Path(input_file).stem
+    optic_nc = f'{output_root}_OPTIC.nc' if output_root else None
+
+    def _extend_component_outputs(prefixes: list[str], suffixes: list[str]) -> None:
+        for prefix in prefixes:
+            clean = ''.join(ch for ch in str(prefix).strip() if ch.isdigit())
+            if not clean:
+                continue
+            tokens = [token.zfill(4) for token in (clean[i:i + 1] for i in range(len(clean)))]
+            if len(tokens) == 2:
+                base = f'{output_root}_{tokens[0]}_{tokens[1]}'
+            elif len(tokens) == 3:
+                base = f'{output_root}_{tokens[0]}_{tokens[1]}_{tokens[2]}'
+            else:
+                continue
+            retrieve_list.extend(f'{base}-{suffix}' for suffix in suffixes)
+
+    parsed = _parse_optic_component_lists(optic_input_text)
+    _extend_component_outputs(parsed['lin_components'][:parsed['num_lin']], ['linopt.out'])
+    _extend_component_outputs(parsed['nonlin_components'][:parsed['num_nonlin']], [
+        'ChiTotRe.out',
+        'ChiTotIm.out',
+        'ChiRe.out',
+        'ChiIm.out',
+        'ChiReDec.out',
+        'ChiImDec.out',
+        'ChiAbs.out',
+    ])
+    _extend_component_outputs(parsed['linel_components'][:parsed['num_linel']], [
+        'ChiEORe.out',
+        'ChiEOIm.out',
+        'ChiEOAbs.out',
+        'ChiEOTotRe.out',
+        'ChiEOTotIm.out',
+    ])
+
+    if optic_nc:
+        retrieve_list.append(optic_nc)
+
+    return list(dict.fromkeys(retrieve_list))
+
+
+
 def _normalize_shift_rows(shift, *, label: str) -> list[list[float]]:
     """Normalize `shiftk`/`shiftq`-style input into a list of 3-component rows."""
     if not isinstance(shift, (list, tuple)):
@@ -139,6 +285,23 @@ class AbinitCalculation(CalcJob):
                    valid_type=orm.RemoteData,
                    required=False,
                    help='A remote folder used for restarts.')
+        spec.input('optic_code',
+                   valid_type=orm.AbstractCode,
+                   required=False,
+                   help='Optional follow-up `optic` code to run serially after ABINIT in the same remote workdir.')
+        spec.input('optic_stdin_file',
+                   valid_type=orm.SinglefileData,
+                   required=False,
+                   help='Input passed to the follow-up `optic` executable through stdin. This input should reference the current job paths directly, e.g. `outdata/out_WFK`.')
+        spec.input('optic_settings',
+                   valid_type=orm.Dict,
+                   required=False,
+                   help='Special settings controlling the follow-up `optic` execution.')
+        spec.input_namespace('optic_files',
+                             valid_type=orm.SinglefileData,
+                             required=False,
+                             dynamic=True,
+                             help='Additional files staged for the follow-up `optic` executable. Destinations under `indata`, `outdata`, or `tmpdata` are rejected to avoid collisions with the ABINIT workdir.')
         spec.input_namespace('pseudos',
                              valid_type=(Psp8Data, JthXmlData),
                              help='The pseudopotentials.',
@@ -491,7 +654,13 @@ class AbinitCalculation(CalcJob):
         parent_folder = self.inputs.get('parent_calc_folder', self.inputs.get('parent_folder', None))
         if parent_folder is not None:
             parameters = self.inputs.parameters.get_dict()
-            same_computer = self.inputs.code.computer.uuid == parent_folder.computer.uuid
+            parent_remote_path_override = settings.pop('PARENT_CALC_FOLDER_PATH', None)
+            parent_source_computer_uuid = parent_folder.computer.uuid
+            parent_source_base_path = parent_folder.get_remote_path()
+            if parent_remote_path_override:
+                parent_source_computer_uuid = self.inputs.code.computer.uuid
+                parent_source_base_path = str(parent_remote_path_override)
+            same_computer = self.inputs.code.computer.uuid == parent_source_computer_uuid
             use_symlink = settings.pop('PARENT_FOLDER_SYMLINK', same_computer)
 
             # Identify the parent OUTPUT prefix and directory
@@ -540,14 +709,14 @@ class AbinitCalculation(CalcJob):
             for filename in existing_in_files:
                 if filename.startswith(parent_in_name):
                     suffix = filename[len(parent_in_name):]
-                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_in_dir, filename)
+                    remote_abs_path = os.path.join(parent_source_base_path, parent_in_dir, filename)
                     files_to_link[suffix] = remote_abs_path
 
             # 2. Process OUTPUT files second (Higher Precedence, overwrites identical suffixes)
             for filename in existing_out_files:
                 if filename.startswith(parent_out_name):
                     suffix = filename[len(parent_out_name):]
-                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_out_dir, filename)
+                    remote_abs_path = os.path.join(parent_source_base_path, parent_out_dir, filename)
                     files_to_link[suffix] = remote_abs_path
 
             # Map and link all resolved files to the new calculation
@@ -557,13 +726,13 @@ class AbinitCalculation(CalcJob):
 
                 if use_symlink:
                     remote_symlink_list.append((
-                        parent_folder.computer.uuid,
+                        parent_source_computer_uuid,
                         remote_abs_path,
                         dest_rel_path,
                     ))
                 else:
                     remote_copy_list.append((
-                        parent_folder.computer.uuid,
+                        parent_source_computer_uuid,
                         remote_abs_path,
                         dest_rel_path,
                     ))
@@ -581,9 +750,83 @@ class AbinitCalculation(CalcJob):
         codeinfo.stdout_name = self.metadata.options.output_filename
         codeinfo.withmpi = self.inputs.metadata.options.withmpi
 
+        codes_info = [codeinfo]
+
+        if 'optic_code' in self.inputs:
+            if 'optic_stdin_file' not in self.inputs:
+                raise exceptions.InputValidationError('`optic_stdin_file` is required when `optic_code` is provided.')
+
+            optic_settings = uppercase_dict(self.inputs.optic_settings.get_dict()) if 'optic_settings' in self.inputs else {}
+            optic_files = self.inputs.get('optic_files', {})
+            optic_files_to_copy = optic_settings.pop('FILES_TO_COPY', None)
+            if optic_files_to_copy is None:
+                optic_files_to_copy = [(label, label) for label in optic_files.keys()]
+
+            if not isinstance(optic_files_to_copy, (list, tuple)):
+                raise exceptions.InputValidationError(
+                    '`optic` `FILES_TO_COPY` setting must be a list of (input_label, destination) pairs.'
+                )
+
+            optic_input_filename = str(optic_settings.pop('INPUT_FILENAME', 'optic.abi'))
+            optic_output_filename = str(optic_settings.pop('OUTPUT_FILENAME', 'aiida.optic.stdout'))
+            optic_withmpi = bool(optic_settings.pop('WITHMPI', False))
+            optic_cmdline = optic_settings.pop('CMDLINE', [])
+            if isinstance(optic_cmdline, str):
+                optic_cmdline = [optic_cmdline]
+            if not isinstance(optic_cmdline, (list, tuple)):
+                raise exceptions.InputValidationError('`optic` `CMDLINE` setting must be a string, list or tuple.')
+
+            local_copy_list.append((
+                self.inputs.optic_stdin_file.uuid,
+                self.inputs.optic_stdin_file.filename,
+                optic_input_filename,
+            ))
+
+            for item in optic_files_to_copy:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise exceptions.InputValidationError(
+                        'Invalid `optic` `FILES_TO_COPY` entry; expected (input_label, destination).'
+                    )
+                link_name, dest_rel_path = item
+                destination = str(dest_rel_path)
+                destination_path = pl.Path(destination)
+                top_level = destination_path.parts[0] if destination_path.parts else ''
+                if top_level in {'indata', 'outdata', 'tmpdata'}:
+                    raise exceptions.InputValidationError(
+                        'Follow-up `optic` files cannot be staged inside `indata`, `outdata`, or `tmpdata`. '
+                        'Reference the current ABINIT job paths directly in `optic_stdin_file` instead.'
+                    )
+                try:
+                    file_node = optic_files[link_name]
+                except (AttributeError, KeyError) as exc:
+                    raise exceptions.InputValidationError(
+                        f'`optic` `FILES_TO_COPY` references missing input file namespace key: {link_name}'
+                    ) from exc
+                local_copy_list.append((file_node.uuid, file_node.filename, destination))
+
+            optic_stdin_text = _read_singlefile_text(self.inputs.optic_stdin_file)
+            retrieve_list += [optic_output_filename]
+            retrieve_list += _infer_optic_retrieve_list_from_text(
+                optic_stdin_text,
+                stdin_filename=self.inputs.optic_stdin_file.filename,
+                files_namespace=optic_files,
+                files_to_copy=optic_files_to_copy,
+            )
+            retrieve_list = list(dict.fromkeys(str(path) for path in retrieve_list if path))
+
+            optic_codeinfo = datastructures.CodeInfo()
+            optic_codeinfo.code_uuid = self.inputs.optic_code.uuid
+            optic_codeinfo.cmdline_params = [optic_input_filename, *[str(param) for param in optic_cmdline]]
+            optic_codeinfo.stdin_name = optic_input_filename
+            optic_codeinfo.stdout_name = optic_output_filename
+            optic_codeinfo.withmpi = optic_withmpi
+            codes_info.append(optic_codeinfo)
+
         # Set up the `CalcInfo` so AiiDA knows what to do with everything
         calcinfo = datastructures.CalcInfo()
-        calcinfo.codes_info = [codeinfo]
+        calcinfo.codes_info = codes_info
+        if len(codes_info) > 1:
+            calcinfo.codes_run_mode = datastructures.CodeRunMode.SERIAL
         calcinfo.stdin_name = self.metadata.options.input_filename
         calcinfo.stdout_name = self.metadata.options.output_filename
         calcinfo.retrieve_list = retrieve_list
@@ -695,7 +938,13 @@ class _AbinitUtilityCalculation(CalcJob):
 
         parent_folder = self.inputs.get('parent_calc_folder', self.inputs.get('parent_folder', None))
         if parent_folder is not None:
-            same_computer = self.inputs.code.computer.uuid == parent_folder.computer.uuid
+            parent_remote_path_override = settings.pop('PARENT_CALC_FOLDER_PATH', None)
+            parent_source_computer_uuid = parent_folder.computer.uuid
+            parent_source_base_path = parent_folder.get_remote_path()
+            if parent_remote_path_override:
+                parent_source_computer_uuid = self.inputs.code.computer.uuid
+                parent_source_base_path = str(parent_remote_path_override)
+            same_computer = self.inputs.code.computer.uuid == parent_source_computer_uuid
             use_symlink = settings.pop('PARENT_FOLDER_SYMLINK', same_computer)
 
             parent_out_prefix = settings.pop('PARENT_OUTDATA_PREFIX', _DATA_PREFIX.get('outdata_prefix', 'outdata/out'))
@@ -733,13 +982,13 @@ class _AbinitUtilityCalculation(CalcJob):
             for filename in existing_in_files:
                 if filename.startswith(parent_in_name):
                     suffix = filename[len(parent_in_name):]
-                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_in_dir, filename)
+                    remote_abs_path = os.path.join(parent_source_base_path, parent_in_dir, filename)
                     files_to_link[suffix] = remote_abs_path
 
             for filename in existing_out_files:
                 if filename.startswith(parent_out_name):
                     suffix = filename[len(parent_out_name):]
-                    remote_abs_path = os.path.join(parent_folder.get_remote_path(), parent_out_dir, filename)
+                    remote_abs_path = os.path.join(parent_source_base_path, parent_out_dir, filename)
                     files_to_link[suffix] = remote_abs_path
 
             for suffix, remote_abs_path in files_to_link.items():
@@ -747,13 +996,13 @@ class _AbinitUtilityCalculation(CalcJob):
                 dest_rel_path = os.path.join(current_in_dir, new_filename)
                 if use_symlink:
                     remote_symlink_list.append((
-                        parent_folder.computer.uuid,
+                        parent_source_computer_uuid,
                         remote_abs_path,
                         dest_rel_path,
                     ))
                 else:
                     remote_copy_list.append((
-                        parent_folder.computer.uuid,
+                        parent_source_computer_uuid,
                         remote_abs_path,
                         dest_rel_path,
                     ))
@@ -838,67 +1087,7 @@ class OpticCalculation(_AbinitUtilityCalculation):
         cmdline_params = super()._generate_cmdline_params(settings)
         return [self.metadata.options.input_filename, *cmdline_params]
 
-    @staticmethod
-    def _parse_optic_component_lists(text: str) -> dict[str, ty.Any]:
-        lines = _split_nonempty_lines(text)
-        num_lin = 0
-        num_nonlin = 0
-        num_linel = 0
-        lin_components: list[str] = []
-        nonlin_components: list[str] = []
-        linel_components: list[str] = []
-
-        for line in lines:
-            parts = [token for token in line.replace(',', ' ').split() if token != '=']
-            if len(parts) < 2:
-                continue
-            key = parts[0].lower()
-            values = parts[1:]
-            if key == 'num_lin_comp':
-                try:
-                    num_lin = int(values[0])
-                except ValueError:
-                    num_lin = 0
-            elif key == 'lin_comp':
-                lin_components = values
-            elif key == 'num_nonlin_comp':
-                try:
-                    num_nonlin = int(values[0])
-                except ValueError:
-                    num_nonlin = 0
-            elif key == 'nonlin_comp':
-                nonlin_components = values
-            elif key == 'num_linel_comp':
-                try:
-                    num_linel = int(values[0])
-                except ValueError:
-                    num_linel = 0
-            elif key == 'linel_comp':
-                linel_components = values
-
-        return {
-            'num_lin': num_lin,
-            'num_nonlin': num_nonlin,
-            'num_linel': num_linel,
-            'lin_components': lin_components,
-            'nonlin_components': nonlin_components,
-            'linel_components': linel_components,
-        }
-
     def _resolve_optic_input_text(self, stdin_text: str) -> tuple[str, str]:
-        lines = _split_nonempty_lines(stdin_text)
-        first_line = lines[0].lstrip() if lines else ''
-        if first_line.startswith('&'):
-            try:
-                input_file = pl.Path(self.inputs.stdin_file.filename).name
-            except Exception:
-                input_file = ''
-            return input_file, stdin_text
-
-        input_file = pl.Path(lines[0]).name if lines else ''
-        if not input_file:
-            return '', ''
-
         files_to_copy = None
         if 'settings' in self.inputs:
             try:
@@ -906,30 +1095,12 @@ class OpticCalculation(_AbinitUtilityCalculation):
             except Exception:
                 files_to_copy = None
 
-        candidate_labels: list[str] = []
-        if isinstance(files_to_copy, (list, tuple)):
-            for item in files_to_copy:
-                if not isinstance(item, (list, tuple)) or len(item) != 2:
-                    continue
-                label, destination = item
-                if pl.Path(str(destination)).name == input_file:
-                    candidate_labels.append(str(label))
-
-        if not candidate_labels:
-            for label, node in self.inputs.get('files', {}).items():
-                try:
-                    if pl.Path(str(node.filename)).name == input_file:
-                        candidate_labels.append(str(label))
-                except Exception:
-                    continue
-
-        for label in candidate_labels:
-            try:
-                return input_file, _read_singlefile_text(self.inputs.files[label])
-            except Exception:
-                continue
-
-        return input_file, ''
+        return _resolve_optic_input_text(
+            stdin_text,
+            stdin_filename=self.inputs.stdin_file.filename,
+            files_namespace=self.inputs.get('files', {}),
+            files_to_copy=files_to_copy,
+        )
 
     def _infer_retrieve_list(self, stdin_text: str, settings: dict) -> list[str]:
         del settings
@@ -955,7 +1126,7 @@ class OpticCalculation(_AbinitUtilityCalculation):
                     continue
                 retrieve_list.extend(f'{base}-{suffix}' for suffix in suffixes)
 
-        parsed = self._parse_optic_component_lists(optic_input_text)
+        parsed = _parse_optic_component_lists(optic_input_text)
         _extend_component_outputs(parsed['lin_components'][:parsed['num_lin']], ['linopt.out'])
         _extend_component_outputs(parsed['nonlin_components'][:parsed['num_nonlin']], [
             'ChiTotRe.out',

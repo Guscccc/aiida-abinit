@@ -5,7 +5,10 @@ import tempfile
 from pathlib import Path
 
 from aiida import orm
-from aiida.common import datastructures, exceptions
+from aiida.common import datastructures, exceptions, LinkType
+from aiida.engine import ExitCode
+from aiida.plugins import ParserFactory
+import netCDF4 as nc
 import pytest
 
 
@@ -225,7 +228,6 @@ def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_reject
                 'toptic_2_0001_0001-linopt.out',
                 'toptic_2_0001_0002_0003-ChiTotRe.out',
                 'toptic_2_0001_0002_0003-ChiTotIm.out',
-                'toptic_2_0001_0002_0003-ChiTotAbs.out',
                 'toptic_2_0001_0002_0003-ChiRe.out',
                 'toptic_2_0001_0002_0003-ChiIm.out',
                 'toptic_2_0001_0002_0003-ChiAbs.out',
@@ -234,7 +236,6 @@ def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_reject
                 'toptic_2_0001_0002_0003-ChiEOAbs.out',
                 'toptic_2_0001_0002_0003-ChiEOTotRe.out',
                 'toptic_2_0001_0002_0003-ChiEOTotIm.out',
-                'toptic_2_0001_0002_0003-ChiEOTotAbs.out',
                 'toptic_2_OPTIC.nc',
             ],
             'aiida.abi',
@@ -283,6 +284,141 @@ def test_abinit_utility_retrieve(
         assert any(item[2] == destination for item in calc_info.local_copy_list)
     if entry_point_name == 'abinit.optic':
         assert calc_info.codes_info[0].cmdline_params[0] == 'aiida.abi'
+
+
+
+def test_abinit_followup_optic_uses_serial_two_code_mode(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    fixture_code,
+):
+    """Test same-workdir serial `abinit -> optic` execution wiring."""
+    from aiida.orm import Dict, SinglefileData
+
+    inputs = generate_inputs_abinit()
+    optic_text = (
+        "&FILES\n"
+        " wfkfile = 'outdata/out_WFK',\n"
+        " ddkfile_1 = 'outdata/out_1WF25',\n"
+        " ddkfile_2 = 'outdata/out_1WF26',\n"
+        " ddkfile_3 = 'outdata/out_1WF27',\n"
+        "/\n"
+        "&PARAMETERS\n"
+        " scissor = 0.1,\n"
+        "/\n"
+        "&COMPUTATIONS\n"
+        " num_lin_comp = 1,\n"
+        " lin_comp = 11,\n"
+        " num_nonlin_comp = 1,\n"
+        " nonlin_comp = 123,\n"
+        " num_linel_comp = 1,\n"
+        " linel_comp = 123,\n"
+        "/\n"
+    )
+    inputs['optic_code'] = fixture_code('abinit.optic')
+    inputs['optic_stdin_file'] = SinglefileData(io.BytesIO(optic_text.encode('utf-8')), filename='optic.abi')
+    inputs['optic_settings'] = Dict(dict={
+        'INPUT_FILENAME': 'optic.abi',
+        'OUTPUT_FILENAME': 'optic.stdout',
+    })
+
+    calc_info = generate_calc_job(fixture_sandbox, 'abinit', inputs)
+
+    assert len(calc_info.codes_info) == 2
+    assert calc_info.codes_run_mode == datastructures.CodeRunMode.SERIAL
+    assert calc_info.codes_info[1].code_uuid == inputs['optic_code'].uuid
+    assert calc_info.codes_info[1].cmdline_params == ['optic.abi']
+    assert calc_info.codes_info[1].stdin_name == 'optic.abi'
+    assert calc_info.codes_info[1].stdout_name == 'optic.stdout'
+    assert any(item[2] == 'optic.abi' for item in calc_info.local_copy_list)
+    assert 'optic.stdout' in calc_info.retrieve_list
+    assert 'optic_OPTIC.nc' in calc_info.retrieve_list
+    assert 'optic_0001_0001-linopt.out' in calc_info.retrieve_list
+    assert 'optic_0001_0002_0003-ChiTotRe.out' in calc_info.retrieve_list
+
+
+
+def test_abinit_followup_optic_rejects_abinit_data_dir_collisions(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    fixture_code,
+):
+    """Test that follow-up `optic` files cannot be staged into ABINIT data directories."""
+    from aiida.orm import Dict, SinglefileData
+
+    inputs = generate_inputs_abinit()
+    inputs['optic_code'] = fixture_code('abinit.optic')
+    inputs['optic_stdin_file'] = SinglefileData(io.BytesIO(b'&FILES\n/\n'), filename='optic.abi')
+    inputs['optic_settings'] = Dict(dict={
+        'FILES_TO_COPY': [('optic_input', 'indata/in_WFK')],
+    })
+    inputs['optic_files'] = {
+        'optic_input': SinglefileData(io.BytesIO(b'dummy\n'), filename='optic_input.dat')
+    }
+
+    with pytest.raises(exceptions.InputValidationError, match='cannot be staged inside `indata`, `outdata`, or `tmpdata`'):
+        generate_calc_job(fixture_sandbox, 'abinit', inputs)
+
+
+
+def test_abinit_parser_fallback_keeps_embedded_optic_outputs(fixture_localhost, tmp_path, monkeypatch):
+    """Test fallback ABINIT parsing still exposes embedded follow-up `optic` outputs."""
+    from aiida.orm import CalcJobNode, Dict, FolderData
+
+    stdout = (
+        '.Version 10.6.3 of ABINIT\n'
+        ' Creating HDf5 file WITHOUT MPI-IO support: optic_OPTIC.nc\n'
+    )
+    (tmp_path / 'aiida.out').write_text(stdout, encoding='utf-8')
+    (tmp_path / 'aiida.optic.stdout').write_text('optic utility completed\n', encoding='utf-8')
+
+    with nc.Dataset(tmp_path / 'optic_OPTIC.nc', 'w') as ds:
+        ds.setncattr('abinit_version', '10.6.3')
+        ds.createDimension('number_of_frequencies', 1)
+        omega = ds.createVariable('omega', 'f8', ('number_of_frequencies',))
+        omega[:] = [0.25]
+
+    node = CalcJobNode(computer=fixture_localhost, process_type='aiida.calculations:abinit')
+    node.set_option('resources', {'num_machines': 1, 'num_mpiprocs_per_machine': 1})
+    node.set_option('max_wallclock_seconds', 1800)
+    node.base.attributes.set_many(
+        {
+            'input_filename': 'aiida.in',
+            'output_filename': 'aiida.out',
+            'error_filename': 'aiida.err',
+            'retrieve_list': ['aiida.out', 'aiida.optic.stdout', 'optic_OPTIC.nc'],
+            'cmdline_params': ['aiida.in'],
+        }
+    )
+    node.base.links.add_incoming(Dict(dict={'optdriver': 8}).store(), link_type=LinkType.INPUT_CALC, link_label='parameters')
+    node.base.links.add_incoming(Dict(dict={}).store(), link_type=LinkType.INPUT_CALC, link_label='settings')
+    node.store()
+
+    retrieved = FolderData()
+    retrieved.put_object_from_tree(tmp_path)
+    retrieved.base.links.add_incoming(node, link_type=LinkType.CREATE, link_label='retrieved')
+    retrieved.store()
+
+    parser = ParserFactory('abinit')(node)
+    monkeypatch.setattr(parser, '_parse_stdout', lambda *args, **kwargs: None)
+    captured_outputs = {}
+    monkeypatch.setattr(parser, 'out', lambda label, value: captured_outputs.__setitem__(label, value))
+    result = parser.parse()
+
+    assert result == ExitCode(0)
+    output_parameters = captured_outputs['output_parameters'].get_dict()
+    assert output_parameters['parser_warning'] == 'No outdata/out_GSR.nc found. Fallback parameters only.'
+    assert output_parameters['is_scf_run'] is False
+    embedded_optic = output_parameters['embedded_optic']
+    assert embedded_optic['stdout'] == stdout
+    assert embedded_optic['cmdline_params'] == ['aiida.in']
+    assert 'aiida.optic.stdout' in embedded_optic['retrieved_files']
+    assert 'optic_OPTIC.nc' in embedded_optic['retrieved_files']
+    assert 'optic_OPTIC.nc' in embedded_optic['created_files']
+    assert 'optic_OPTIC.nc' in embedded_optic['nc_files']
+    assert embedded_optic['nc_files']['optic_OPTIC.nc']['global_attributes']['abinit_version'] == '10.6.3'
 
 
 

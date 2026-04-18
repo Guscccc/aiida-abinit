@@ -62,6 +62,33 @@ def _parse_created_output_files(stdout_text):
 
 
 
+def _build_retrieved_output_summary(dirpath, *, output_filename, retrieve_list, cmdline_params=None, parsed_arguments=None):
+    retrieved_files = []
+    missing_files = []
+    for relpath in retrieve_list or []:
+        candidate = _resolve_retrieved_path(dirpath, relpath)
+        if candidate is not None:
+            retrieved_files.append(str(relpath))
+        else:
+            missing_files.append(str(relpath))
+
+    stdout_text = ''
+    stdout_filepath = _resolve_retrieved_path(dirpath, output_filename)
+    if stdout_filepath is not None:
+        stdout_text = stdout_filepath.read_text(encoding='utf-8')
+
+    return {
+        'stdout': stdout_text,
+        'cmdline_params': list(cmdline_params or []),
+        'parsed_arguments': dict(parsed_arguments or {}),
+        'retrieved_files': sorted(set(retrieved_files)),
+        'missing_retrieved_files': sorted(set(missing_files)),
+        'created_files': _parse_created_output_files(stdout_text),
+        'nc_files': _AbinitUtilityParser._parse_nc_outputs(None, dirpath),
+    }
+
+
+
 def _clean_text_value(text):
     return str(text).replace('\x00', '').strip()
 
@@ -271,7 +298,13 @@ class AbinitParser(Parser):
                 )
                 fallback_data = {
                     'parser_warning': f'No {gsr_filename} found. Fallback parameters only.',
-                    'is_scf_run': False
+                    'is_scf_run': False,
+                    'embedded_optic': _build_retrieved_output_summary(
+                        dirpath,
+                        output_filename=output_filename,
+                        retrieve_list=retrieve_list,
+                        cmdline_params=self.node.base.attributes.get('cmdline_params', []),
+                    ),
                 }
                 self.out('output_parameters', Dict(dict=fallback_data))
 
@@ -525,31 +558,20 @@ class _AbinitUtilityParser(Parser):
                 return self.exit_codes.ERROR_OUTPUT_MISSING
 
             try:
-                stdout_text = stdout_filepath.read_text(encoding='utf-8')
+                stdout_filepath.read_text(encoding='utf-8')
             except OSError:
                 self.logger.exception('unable to read stdout for CalcJobNode<%s>', self.node.pk)
                 return self.exit_codes.ERROR_OUTPUT_READ
 
-            retrieved_files = []
-            missing_files = []
-            for relpath in retrieve_list:
-                candidate = _resolve_retrieved_path(dirpath, relpath)
-                if candidate is not None:
-                    retrieved_files.append(str(relpath))
-                else:
-                    missing_files.append(str(relpath))
+            summary = _build_retrieved_output_summary(
+                dirpath,
+                output_filename=output_filename,
+                retrieve_list=retrieve_list,
+                cmdline_params=cmdline_params,
+                parsed_arguments=parsed_arguments,
+            )
 
-            nc_files = self._parse_nc_outputs(dirpath)
-
-        self.out('output_parameters', Dict(dict={
-            'stdout': stdout_text,
-            'cmdline_params': cmdline_params,
-            'parsed_arguments': parsed_arguments,
-            'retrieved_files': sorted(set(retrieved_files)),
-            'missing_retrieved_files': sorted(set(missing_files)),
-            'created_files': _parse_created_output_files(stdout_text),
-            'nc_files': nc_files,
-        }))
+        self.out('output_parameters', Dict(dict=summary))
         return ExitCode(0)
 
 
