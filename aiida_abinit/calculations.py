@@ -292,7 +292,12 @@ class AbinitCalculation(CalcJob):
         spec.input('optic_stdin_file',
                    valid_type=orm.SinglefileData,
                    required=False,
-                   help='Input passed to the follow-up `optic` executable through stdin. This input should reference the current job paths directly, e.g. `outdata/out_WFK`.')
+                   help='Input passed to a single follow-up `optic` executable through stdin. This input should reference the current job paths directly, e.g. `outdata/out_WFK`.')
+        spec.input_namespace('optic_stdin_files',
+                             valid_type=orm.SinglefileData,
+                             required=False,
+                             dynamic=True,
+                             help='Optional multiple follow-up `optic` stdin files. When provided, the calculation runs one `optic` executable per file serially in the same remote workdir.')
         spec.input('optic_settings',
                    valid_type=orm.Dict,
                    required=False,
@@ -753,8 +758,16 @@ class AbinitCalculation(CalcJob):
         codes_info = [codeinfo]
 
         if 'optic_code' in self.inputs:
-            if 'optic_stdin_file' not in self.inputs:
-                raise exceptions.InputValidationError('`optic_stdin_file` is required when `optic_code` is provided.')
+            has_single_optic = 'optic_stdin_file' in self.inputs
+            has_multi_optic = 'optic_stdin_files' in self.inputs and bool(self.inputs.optic_stdin_files)
+            if not has_single_optic and not has_multi_optic:
+                raise exceptions.InputValidationError(
+                    '`optic_stdin_file` or `optic_stdin_files` is required when `optic_code` is provided.'
+                )
+            if has_single_optic and has_multi_optic:
+                raise exceptions.InputValidationError(
+                    'Use either `optic_stdin_file` or `optic_stdin_files`, not both.'
+                )
 
             optic_settings = uppercase_dict(self.inputs.optic_settings.get_dict()) if 'optic_settings' in self.inputs else {}
             optic_files = self.inputs.get('optic_files', {})
@@ -767,20 +780,40 @@ class AbinitCalculation(CalcJob):
                     '`optic` `FILES_TO_COPY` setting must be a list of (input_label, destination) pairs.'
                 )
 
-            optic_input_filename = str(optic_settings.pop('INPUT_FILENAME', 'optic.abi'))
-            optic_output_filename = str(optic_settings.pop('OUTPUT_FILENAME', 'aiida.optic.stdout'))
-            optic_withmpi = bool(optic_settings.pop('WITHMPI', False))
+            optic_withmpi = bool(optic_settings.pop('WITHMPI', True))
             optic_cmdline = optic_settings.pop('CMDLINE', [])
             if isinstance(optic_cmdline, str):
                 optic_cmdline = [optic_cmdline]
             if not isinstance(optic_cmdline, (list, tuple)):
                 raise exceptions.InputValidationError('`optic` `CMDLINE` setting must be a string, list or tuple.')
 
-            local_copy_list.append((
-                self.inputs.optic_stdin_file.uuid,
-                self.inputs.optic_stdin_file.filename,
-                optic_input_filename,
-            ))
+            if has_single_optic:
+                followup_optic_runs = [(
+                    self.inputs.optic_stdin_file,
+                    str(optic_settings.pop('INPUT_FILENAME', 'optic.abi')),
+                    str(optic_settings.pop('OUTPUT_FILENAME', 'aiida.optic.stdout')),
+                )]
+            else:
+                if 'INPUT_FILENAME' in optic_settings or 'OUTPUT_FILENAME' in optic_settings:
+                    raise exceptions.InputValidationError(
+                        '`INPUT_FILENAME` and `OUTPUT_FILENAME` are only supported with a single `optic_stdin_file`.'
+                    )
+                followup_optic_runs = []
+                seen_input_filenames = set()
+                for label, singlefile in sorted(self.inputs.optic_stdin_files.items()):
+                    optic_input_filename = str(singlefile.filename)
+                    if not optic_input_filename:
+                        raise exceptions.InputValidationError(
+                            f'Follow-up `optic` stdin file for label {label!r} must define a filename.'
+                        )
+                    if optic_input_filename in seen_input_filenames:
+                        raise exceptions.InputValidationError(
+                            f'Duplicate follow-up `optic` input filename detected: {optic_input_filename!r}'
+                        )
+                    seen_input_filenames.add(optic_input_filename)
+                    input_stem = pl.Path(optic_input_filename).stem or str(label)
+                    optic_output_filename = f'aiida.{input_stem}.stdout'
+                    followup_optic_runs.append((singlefile, optic_input_filename, optic_output_filename))
 
             for item in optic_files_to_copy:
                 if not isinstance(item, (list, tuple)) or len(item) != 2:
@@ -794,7 +827,7 @@ class AbinitCalculation(CalcJob):
                 if top_level in {'indata', 'outdata', 'tmpdata'}:
                     raise exceptions.InputValidationError(
                         'Follow-up `optic` files cannot be staged inside `indata`, `outdata`, or `tmpdata`. '
-                        'Reference the current ABINIT job paths directly in `optic_stdin_file` instead.'
+                        'Reference the current ABINIT job paths directly in the `optic` stdin file instead.'
                     )
                 try:
                     file_node = optic_files[link_name]
@@ -804,23 +837,30 @@ class AbinitCalculation(CalcJob):
                     ) from exc
                 local_copy_list.append((file_node.uuid, file_node.filename, destination))
 
-            optic_stdin_text = _read_singlefile_text(self.inputs.optic_stdin_file)
-            retrieve_list += [optic_output_filename]
-            retrieve_list += _infer_optic_retrieve_list_from_text(
-                optic_stdin_text,
-                stdin_filename=self.inputs.optic_stdin_file.filename,
-                files_namespace=optic_files,
-                files_to_copy=optic_files_to_copy,
-            )
-            retrieve_list = list(dict.fromkeys(str(path) for path in retrieve_list if path))
+            for singlefile, optic_input_filename, optic_output_filename in followup_optic_runs:
+                local_copy_list.append((
+                    singlefile.uuid,
+                    singlefile.filename,
+                    optic_input_filename,
+                ))
+                optic_stdin_text = _read_singlefile_text(singlefile)
+                retrieve_list += [optic_output_filename]
+                retrieve_list += _infer_optic_retrieve_list_from_text(
+                    optic_stdin_text,
+                    stdin_filename=singlefile.filename,
+                    files_namespace=optic_files,
+                    files_to_copy=optic_files_to_copy,
+                )
 
-            optic_codeinfo = datastructures.CodeInfo()
-            optic_codeinfo.code_uuid = self.inputs.optic_code.uuid
-            optic_codeinfo.cmdline_params = [optic_input_filename, *[str(param) for param in optic_cmdline]]
-            optic_codeinfo.stdin_name = optic_input_filename
-            optic_codeinfo.stdout_name = optic_output_filename
-            optic_codeinfo.withmpi = optic_withmpi
-            codes_info.append(optic_codeinfo)
+                optic_codeinfo = datastructures.CodeInfo()
+                optic_codeinfo.code_uuid = self.inputs.optic_code.uuid
+                optic_codeinfo.cmdline_params = [optic_input_filename, *[str(param) for param in optic_cmdline]]
+                optic_codeinfo.stdin_name = optic_input_filename
+                optic_codeinfo.stdout_name = optic_output_filename
+                optic_codeinfo.withmpi = optic_withmpi
+                codes_info.append(optic_codeinfo)
+
+            retrieve_list = list(dict.fromkeys(str(path) for path in retrieve_list if path))
 
         # Set up the `CalcInfo` so AiiDA knows what to do with everything
         calcinfo = datastructures.CalcInfo()
