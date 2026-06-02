@@ -696,15 +696,21 @@ class AbinitCalculation(CalcJob):
             try:
                 list_dir_target_out = parent_out_dir if parent_out_dir != './' else '.'
                 existing_out_files = parent_folder.listdir(list_dir_target_out)
-            except Exception:
-                existing_out_files = []
+            except Exception as exc:
+                raise exceptions.InputValidationError(
+                    f'Could not list parent restart output directory {list_dir_target_out!r} '
+                    f'in {parent_source_base_path!r}.'
+                ) from exc
 
             # Retrieve parent IN files
             try:
                 list_dir_target_in = parent_in_dir if parent_in_dir != './' else '.'
                 existing_in_files = parent_folder.listdir(list_dir_target_in)
-            except Exception:
-                existing_in_files = []
+            except Exception as exc:
+                raise exceptions.InputValidationError(
+                    f'Could not list parent restart input directory {list_dir_target_in!r} '
+                    f'in {parent_source_base_path!r}.'
+                ) from exc
 
             # Dictionary to track files by their suffix and enforce output precedence
             # Format: { suffix: remote_abs_path }
@@ -1008,14 +1014,20 @@ class _AbinitUtilityCalculation(CalcJob):
             try:
                 list_dir_target_out = parent_out_dir if parent_out_dir != './' else '.'
                 existing_out_files = parent_folder.listdir(list_dir_target_out)
-            except Exception:
-                existing_out_files = []
+            except Exception as exc:
+                raise exceptions.InputValidationError(
+                    f'Could not list parent restart output directory {list_dir_target_out!r} '
+                    f'in {parent_source_base_path!r}.'
+                ) from exc
 
             try:
                 list_dir_target_in = parent_in_dir if parent_in_dir != './' else '.'
                 existing_in_files = parent_folder.listdir(list_dir_target_in)
-            except Exception:
-                existing_in_files = []
+            except Exception as exc:
+                raise exceptions.InputValidationError(
+                    f'Could not list parent restart input directory {list_dir_target_in!r} '
+                    f'in {parent_source_base_path!r}.'
+                ) from exc
 
             files_to_link = {}
 

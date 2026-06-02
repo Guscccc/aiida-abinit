@@ -122,6 +122,29 @@ def test_abinit_mismatched_explicit_shiftk_is_rejected(fixture_sandbox, generate
         generate_calc_job(fixture_sandbox, entry_point_name, inputs)
 
 
+def test_abinit_parent_restart_listdir_failure_is_rejected(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    generate_remote_data,
+    fixture_localhost,
+    monkeypatch,
+):
+    """Parent restart listing errors must fail during preparation."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    inputs['parent_calc_folder'] = generate_remote_data(fixture_localhost, '/tmp/parent', entry_point_name)
+
+    def raise_listdir(_self, _path='.'):
+        raise OSError('transport listing failed')
+
+    monkeypatch.setattr(orm.RemoteData, 'listdir', raise_listdir)
+
+    with pytest.raises(exceptions.InputValidationError, match='Could not list parent restart output directory'):
+        generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+
 
 def test_abinit_multishift_explicit_shiftk_is_accepted_for_gamma_centered_mesh(
     fixture_sandbox,
@@ -180,6 +203,43 @@ def test_abinit_multishift_explicit_shiftk_with_shifted_kpoints_offset_is_reject
     inputs['parameters'] = orm.Dict(dict=parameters)
 
     with pytest.raises(exceptions.InputValidationError, match='set the `kpoints` mesh offset to Gamma'):
+        generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+
+def test_abinit_utility_parent_restart_listdir_failure_is_rejected(
+    fixture_sandbox,
+    generate_calc_job,
+    fixture_code,
+    generate_remote_data,
+    fixture_localhost,
+    monkeypatch,
+):
+    """Utility CalcJobs must not silently ignore parent restart listing errors."""
+    entry_point_name = 'abinit.optic'
+
+    stdin_file = orm.SinglefileData(io.BytesIO(b'toptic_2.abi\n'), filename='stdin.in')
+    inputs = {
+        'code': fixture_code(entry_point_name),
+        'stdin_file': stdin_file,
+        'files': {},
+        'parent_calc_folder': generate_remote_data(fixture_localhost, '/tmp/parent', entry_point_name),
+        'metadata': {
+            'options': {
+                'resources': {
+                    'num_machines': 1,
+                    'num_mpiprocs_per_machine': 1,
+                },
+                'max_wallclock_seconds': 1800,
+            }
+        },
+    }
+
+    def raise_listdir(_self, _path='.'):
+        raise OSError('transport listing failed')
+
+    monkeypatch.setattr(orm.RemoteData, 'listdir', raise_listdir)
+
+    with pytest.raises(exceptions.InputValidationError, match='Could not list parent restart output directory'):
         generate_calc_job(fixture_sandbox, entry_point_name, inputs)
 
 
