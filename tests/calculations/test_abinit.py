@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for the calculation classes."""
 import io
+import json
 import tempfile
 from pathlib import Path
 
@@ -143,6 +144,152 @@ def test_abinit_parent_restart_listdir_failure_is_rejected(
 
     with pytest.raises(exceptions.InputValidationError, match='Could not list parent restart output directory'):
         generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+
+def test_abinit_parent_restart_uses_outdata_over_indata(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    generate_remote_data,
+    fixture_localhost,
+    monkeypatch,
+):
+    """Fresh parent outputs must take precedence over inherited parent inputs."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    inputs['parent_calc_folder'] = generate_remote_data(fixture_localhost, '/tmp/parent', entry_point_name)
+
+    def listdir(_self, path='.'):
+        if path == 'outdata':
+            return ['out_DEN', 'out_WFK']
+        if path == 'indata':
+            return ['in_DEN', 'in_WFK']
+        return []
+
+    monkeypatch.setattr(orm.RemoteData, 'listdir', listdir)
+
+    calc_info = generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+    assert (
+        fixture_localhost.uuid,
+        '/tmp/parent/outdata/out_DEN',
+        'indata/in_DEN',
+    ) in calc_info.remote_symlink_list
+    assert (
+        fixture_localhost.uuid,
+        '/tmp/parent/indata/in_DEN',
+        'indata/in_DEN',
+    ) not in calc_info.remote_symlink_list
+    assert '_aiida_restart_links.json' in calc_info.retrieve_list
+
+    with fixture_sandbox.open('_aiida_restart_links.json') as handle:
+        manifest = json.load(handle)
+
+    assert manifest['outdata_overwrote_indata_suffixes'] == ['_DEN', '_WFK']
+    assert manifest['final_links'][0]['destination'].startswith('indata/in')
+
+
+def test_abinit_parent_restart_indata_links_can_be_disabled(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    generate_remote_data,
+    fixture_localhost,
+    monkeypatch,
+):
+    """Inherited parent inputs can be rejected when strict output-only restarts are requested."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    inputs['parent_calc_folder'] = generate_remote_data(fixture_localhost, '/tmp/parent', entry_point_name)
+    inputs['settings'] = orm.Dict(dict={'PARENT_RESTART_LINK_INDATA': False})
+
+    def listdir(_self, path='.'):
+        if path == 'outdata':
+            return []
+        if path == 'indata':
+            return ['in_DEN', 'in_WFK']
+        return []
+
+    monkeypatch.setattr(orm.RemoteData, 'listdir', listdir)
+
+    with pytest.raises(exceptions.InputValidationError, match='PARENT_RESTART_LINK_INDATA=False'):
+        generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+
+def test_abinit_parent_restart_indata_links_are_enabled_by_default(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    generate_remote_data,
+    fixture_localhost,
+    monkeypatch,
+):
+    """Inherited parent inputs are staged by default for compatibility."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    inputs['parent_calc_folder'] = generate_remote_data(fixture_localhost, '/tmp/parent', entry_point_name)
+
+    def listdir(_self, path='.'):
+        if path == 'outdata':
+            return []
+        if path == 'indata':
+            return ['in_DEN']
+        return []
+
+    monkeypatch.setattr(orm.RemoteData, 'listdir', listdir)
+
+    calc_info = generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+    assert (
+        fixture_localhost.uuid,
+        '/tmp/parent/indata/in_DEN',
+        'indata/in_DEN',
+    ) in calc_info.remote_symlink_list
+
+
+def test_abinit_parent_restart_default_indata_merge_behavior(
+    fixture_sandbox,
+    generate_calc_job,
+    generate_inputs_abinit,
+    generate_remote_data,
+    fixture_localhost,
+    monkeypatch,
+):
+    """Default restart staging merges inherited inputs first, then fresh outputs."""
+    entry_point_name = 'abinit'
+
+    inputs = generate_inputs_abinit()
+    inputs['parent_calc_folder'] = generate_remote_data(fixture_localhost, '/tmp/parent', entry_point_name)
+
+    def listdir(_self, path='.'):
+        if path == 'outdata':
+            return ['out_DEN']
+        if path == 'indata':
+            return ['in_DEN', 'in_CUSTOM']
+        return []
+
+    monkeypatch.setattr(orm.RemoteData, 'listdir', listdir)
+
+    calc_info = generate_calc_job(fixture_sandbox, entry_point_name, inputs)
+
+    assert (
+        fixture_localhost.uuid,
+        '/tmp/parent/outdata/out_DEN',
+        'indata/in_DEN',
+    ) in calc_info.remote_symlink_list
+    assert (
+        fixture_localhost.uuid,
+        '/tmp/parent/indata/in_CUSTOM',
+        'indata/in_CUSTOM',
+    ) in calc_info.remote_symlink_list
+    assert (
+        fixture_localhost.uuid,
+        '/tmp/parent/indata/in_DEN',
+        'indata/in_DEN',
+    ) not in calc_info.remote_symlink_list
 
 
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """CalcJob class for Abinit."""
 import io
+import json
 import os
 import pathlib as pl
 import typing as ty
@@ -118,6 +119,145 @@ def _resolve_optic_input_text(
             continue
 
     return input_file, ''
+
+
+def _as_bool(value: ty.Any) -> bool:
+    """Return a strict boolean from plugin settings values."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {'1', 'true', 'yes', 'on'}:
+            return True
+        if lowered in {'0', 'false', 'no', 'off'}:
+            return False
+    return bool(value)
+
+
+def _resolve_restart_files(
+    *,
+    parent_source_base_path: str,
+    parent_out_dir: str,
+    parent_out_name: str,
+    existing_out_files: ty.Iterable[str],
+    parent_in_dir: str,
+    parent_in_name: str,
+    existing_in_files: ty.Iterable[str],
+    link_parent_indata: bool,
+) -> dict[str, str]:
+    """Resolve restart files with explicit input-then-output semantics.
+
+    Parent `indata/in_*` files are often inherited symlinks to the grandparent
+    calculation. They are still linked by default for compatibility, but the
+    caller writes a restart-link manifest so the final staged sources are clear.
+    """
+
+    out_matches: dict[str, str] = {}
+    for filename in existing_out_files:
+        if filename.startswith(parent_out_name):
+            suffix = filename[len(parent_out_name):]
+            out_matches[suffix] = os.path.join(parent_source_base_path, parent_out_dir, filename)
+
+    in_matches: dict[str, str] = {}
+    for filename in existing_in_files:
+        if filename.startswith(parent_in_name):
+            suffix = filename[len(parent_in_name):]
+            in_matches[suffix] = os.path.join(parent_source_base_path, parent_in_dir, filename)
+
+    if link_parent_indata:
+        merged = dict(in_matches)
+        merged.update(out_matches)
+        if merged:
+            return merged
+
+    if out_matches:
+        return out_matches
+
+    if in_matches and not link_parent_indata:
+        raise exceptions.InputValidationError(
+            'Parent restart output files were not found, but inherited input restart files were found. '
+            'The plugin will not stage parent `indata/in_*` files because `PARENT_RESTART_LINK_INDATA=False`. '
+            'Use the default `PARENT_RESTART_LINK_INDATA=True` if inherited input files are intended; with that '
+            'setting, parent `indata` and `outdata` are merged and `outdata` wins suffix collisions.'
+        )
+
+    if in_matches:
+        return in_matches
+
+    raise exceptions.InputValidationError(
+        'No parent restart files found. Expected files matching '
+        f'{parent_out_dir}/{parent_out_name}* in parent `outdata`, or explicitly allowed fallback files matching '
+        f'{parent_in_dir}/{parent_in_name}* in parent `indata`.'
+    )
+
+
+def _restart_manifest_entries(
+    *,
+    parent_source_computer_uuid: str,
+    parent_source_base_path: str,
+    parent_out_dir: str,
+    parent_out_name: str,
+    existing_out_files: ty.Iterable[str],
+    parent_in_dir: str,
+    parent_in_name: str,
+    existing_in_files: ty.Iterable[str],
+    current_in_dir: str,
+    current_in_name: str,
+    files_to_link: ty.Mapping[str, str],
+    transfer_mode: str,
+    link_parent_indata: bool,
+) -> dict[str, ty.Any]:
+    """Build a small audit manifest for parent restart links."""
+
+    out_suffixes = sorted(
+        filename[len(parent_out_name):]
+        for filename in existing_out_files
+        if filename.startswith(parent_out_name)
+    )
+    in_suffixes = sorted(
+        filename[len(parent_in_name):]
+        for filename in existing_in_files
+        if filename.startswith(parent_in_name)
+    )
+    out_set = set(out_suffixes)
+    in_set = set(in_suffixes)
+
+    final_links = []
+    for suffix, source_path in sorted(files_to_link.items()):
+        source_kind = 'parent_outdata' if suffix in out_set else 'parent_indata'
+        final_links.append(
+            {
+                'suffix': suffix,
+                'destination': os.path.join(current_in_dir, f'{current_in_name}{suffix}'),
+                'source': source_path,
+                'source_kind': source_kind,
+                'source_computer_uuid': str(parent_source_computer_uuid),
+                'transfer_mode': transfer_mode,
+            }
+        )
+
+    return {
+        'parent_source_base_path': parent_source_base_path,
+        'link_parent_indata': bool(link_parent_indata),
+        'parent_indata_prefix': os.path.join(parent_in_dir, parent_in_name),
+        'parent_outdata_prefix': os.path.join(parent_out_dir, parent_out_name),
+        'current_indata_prefix': os.path.join(current_in_dir, current_in_name),
+        'parent_indata_suffixes': in_suffixes,
+        'parent_outdata_suffixes': out_suffixes,
+        'outdata_overwrote_indata_suffixes': sorted(in_set & out_set),
+        'indata_only_suffixes': sorted(in_set - out_set),
+        'outdata_only_suffixes': sorted(out_set - in_set),
+        'final_links': final_links,
+    }
+
+
+def _write_restart_manifest(folder, filename: str, manifest: dict[str, ty.Any]) -> None:
+    """Write restart-link audit information to the submission folder."""
+
+    with io.open(folder.get_abs_path(filename), mode='w', encoding='utf-8') as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write('\n')
 
 
 
@@ -629,6 +769,8 @@ class AbinitCalculation(CalcJob):
         local_copy_list = []
         remote_copy_list = []
         remote_symlink_list = []
+        restart_manifest = None
+        restart_manifest_filename = settings.pop('PARENT_RESTART_MANIFEST_FILENAME', '_aiida_restart_links.json')
 
         # Create the subfolder which will contain the pseudopotential files
         folder.get_subfolder(self._PSEUDO_SUBFOLDER, create=True)
@@ -712,23 +854,32 @@ class AbinitCalculation(CalcJob):
                     f'in {parent_source_base_path!r}.'
                 ) from exc
 
-            # Dictionary to track files by their suffix and enforce output precedence
-            # Format: { suffix: remote_abs_path }
-            files_to_link = {}
-
-            # 1. Process INPUT files first (Lower Precedence)
-            for filename in existing_in_files:
-                if filename.startswith(parent_in_name):
-                    suffix = filename[len(parent_in_name):]
-                    remote_abs_path = os.path.join(parent_source_base_path, parent_in_dir, filename)
-                    files_to_link[suffix] = remote_abs_path
-
-            # 2. Process OUTPUT files second (Higher Precedence, overwrites identical suffixes)
-            for filename in existing_out_files:
-                if filename.startswith(parent_out_name):
-                    suffix = filename[len(parent_out_name):]
-                    remote_abs_path = os.path.join(parent_source_base_path, parent_out_dir, filename)
-                    files_to_link[suffix] = remote_abs_path
+            link_parent_indata = _as_bool(settings.pop('PARENT_RESTART_LINK_INDATA', True))
+            files_to_link = _resolve_restart_files(
+                parent_source_base_path=parent_source_base_path,
+                parent_out_dir=parent_out_dir,
+                parent_out_name=parent_out_name,
+                existing_out_files=existing_out_files,
+                parent_in_dir=parent_in_dir,
+                parent_in_name=parent_in_name,
+                existing_in_files=existing_in_files,
+                link_parent_indata=link_parent_indata,
+            )
+            restart_manifest = _restart_manifest_entries(
+                parent_source_computer_uuid=parent_source_computer_uuid,
+                parent_source_base_path=parent_source_base_path,
+                parent_out_dir=parent_out_dir,
+                parent_out_name=parent_out_name,
+                existing_out_files=existing_out_files,
+                parent_in_dir=parent_in_dir,
+                parent_in_name=parent_in_name,
+                existing_in_files=existing_in_files,
+                current_in_dir=current_in_dir,
+                current_in_name=current_in_name,
+                files_to_link=files_to_link,
+                transfer_mode='symlink' if use_symlink else 'copy',
+                link_parent_indata=link_parent_indata,
+            )
 
             # Map and link all resolved files to the new calculation
             for suffix, remote_abs_path in files_to_link.items():
@@ -753,6 +904,9 @@ class AbinitCalculation(CalcJob):
 
         # Generate list of files to retrieve from wherever the calculation is run
         retrieve_list = self._generate_retrieve_list(self.inputs.parameters, settings)
+        if restart_manifest is not None:
+            _write_restart_manifest(folder, restart_manifest_filename, restart_manifest)
+            retrieve_list.append(restart_manifest_filename)
 
         # Set up the `CodeInfo` to pass to `CalcInfo`
         codeinfo = datastructures.CodeInfo()
@@ -962,6 +1116,8 @@ class _AbinitUtilityCalculation(CalcJob):
         ]
         remote_copy_list = []
         remote_symlink_list = []
+        restart_manifest = None
+        restart_manifest_filename = settings.pop('PARENT_RESTART_MANIFEST_FILENAME', '_aiida_restart_links.json')
 
         files_to_copy = settings.pop('FILES_TO_COPY', None)
         if files_to_copy is None:
@@ -1029,19 +1185,32 @@ class _AbinitUtilityCalculation(CalcJob):
                     f'in {parent_source_base_path!r}.'
                 ) from exc
 
-            files_to_link = {}
-
-            for filename in existing_in_files:
-                if filename.startswith(parent_in_name):
-                    suffix = filename[len(parent_in_name):]
-                    remote_abs_path = os.path.join(parent_source_base_path, parent_in_dir, filename)
-                    files_to_link[suffix] = remote_abs_path
-
-            for filename in existing_out_files:
-                if filename.startswith(parent_out_name):
-                    suffix = filename[len(parent_out_name):]
-                    remote_abs_path = os.path.join(parent_source_base_path, parent_out_dir, filename)
-                    files_to_link[suffix] = remote_abs_path
+            link_parent_indata = _as_bool(settings.pop('PARENT_RESTART_LINK_INDATA', True))
+            files_to_link = _resolve_restart_files(
+                parent_source_base_path=parent_source_base_path,
+                parent_out_dir=parent_out_dir,
+                parent_out_name=parent_out_name,
+                existing_out_files=existing_out_files,
+                parent_in_dir=parent_in_dir,
+                parent_in_name=parent_in_name,
+                existing_in_files=existing_in_files,
+                link_parent_indata=link_parent_indata,
+            )
+            restart_manifest = _restart_manifest_entries(
+                parent_source_computer_uuid=parent_source_computer_uuid,
+                parent_source_base_path=parent_source_base_path,
+                parent_out_dir=parent_out_dir,
+                parent_out_name=parent_out_name,
+                existing_out_files=existing_out_files,
+                parent_in_dir=parent_in_dir,
+                parent_in_name=parent_in_name,
+                existing_in_files=existing_in_files,
+                current_in_dir=current_in_dir,
+                current_in_name=current_in_name,
+                files_to_link=files_to_link,
+                transfer_mode='symlink' if use_symlink else 'copy',
+                link_parent_indata=link_parent_indata,
+            )
 
             for suffix, remote_abs_path in files_to_link.items():
                 new_filename = f'{current_in_name}{suffix}'
@@ -1061,6 +1230,9 @@ class _AbinitUtilityCalculation(CalcJob):
 
         cmdline_params = self._generate_cmdline_params(settings)
         retrieve_list = self._generate_retrieve_list(settings, stdin_text)
+        if restart_manifest is not None:
+            _write_restart_manifest(folder, restart_manifest_filename, restart_manifest)
+            retrieve_list.append(restart_manifest_filename)
 
         codeinfo = datastructures.CodeInfo()
         codeinfo.code_uuid = self.inputs.code.uuid
